@@ -12,9 +12,11 @@ const {
   EmbedBuilder,
   ActionRowBuilder,
   StringSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   AttachmentBuilder,
-  ChannelType,
-  Events
+  Events,
+  ChannelType
 } = require("discord.js");
 
 const OpenAI = require("openai");
@@ -29,10 +31,6 @@ const http = require("http");
 const PREFIX = "m!";
 const PORT = process.env.PORT || 10000;
 const DATA_FILE = path.join(__dirname, "madokami-data.json");
-
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
 
 const client = new Client({
   intents: [
@@ -50,8 +48,16 @@ const client = new Client({
   ]
 });
 
+let openai = null;
+
+if (process.env.OPENAI_API_KEY) {
+  openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+  });
+}
+
 // ============================================================
-// BASE DE DATOS
+// DATABASE
 // ============================================================
 
 let db = {};
@@ -62,80 +68,131 @@ function loadDB() {
       db = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
     } else {
       db = {};
-      saveDB();
     }
-  } catch (err) {
-    console.error("Error cargando DB:", err);
+  } catch (error) {
+    console.error("Error cargando DB:", error);
     db = {};
   }
 }
 
+let saveTimer = null;
+
 function saveDB() {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
-  } catch (err) {
-    console.error("Error guardando DB:", err);
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify(db, null, 2)
+    );
+  } catch (error) {
+    console.error("Error guardando DB:", error);
   }
 }
 
-function guildData(guildId) {
+function scheduleSave() {
+  clearTimeout(saveTimer);
+
+  saveTimer = setTimeout(() => {
+    saveDB();
+  }, 1000);
+}
+
+function defaultGuild() {
+  return {
+    config: {
+      antiLink: false,
+      antiSpam: false,
+      logChannel: null,
+      welcome: false,
+      welcomeChannel: null,
+      welcomeMessage: "🌸 Bienvenido/a {user} a {server}!",
+      autoRole: null
+    },
+
+    users: {},
+    warns: {}
+  };
+}
+
+function getGuild(guildId) {
   if (!db[guildId]) {
-    db[guildId] = {
-      config: {
-        prefix: PREFIX,
-        antiLink: false,
-        antiSpam: false,
-        logChannel: null,
-        welcome: false,
-        welcomeChannel: null,
-        welcomeMessage: "🌸 Bienvenido/a {user} a {server}!",
-        autoRole: null,
-        mutedRole: null
-      },
-      users: {},
-      warns: {},
-      messages: 0
-    };
+    db[guildId] = defaultGuild();
+    scheduleSave();
   }
+
+  if (!db[guildId].config) {
+    db[guildId].config = defaultGuild().config;
+  }
+
+  if (!db[guildId].users) db[guildId].users = {};
+  if (!db[guildId].warns) db[guildId].warns = {};
 
   return db[guildId];
 }
 
-function userData(guildId, userId) {
-  const g = guildData(guildId);
-
-  if (!g.users[userId]) {
-    g.users[userId] = {
-      wallet: 0,
-      bank: 0,
-      xp: 0,
-      level: 1,
-      messages: 0,
-      commands: 0,
-      earned: 0,
-      spent: 0,
-      dailyAt: 0,
-      workAt: 0,
-      transactions: [],
-      joinedAt: Date.now()
-    };
-  }
-
-  return g.users[userId];
+function defaultUser() {
+  return {
+    wallet: 0,
+    bank: 0,
+    xp: 0,
+    messages: 0,
+    commands: 0,
+    bio: "",
+    daily: 0,
+    work: 0,
+    salary: 0
+  };
 }
 
-loadDB();
+function getUser(guildId, userId) {
+  const guild = getGuild(guildId);
+
+  if (!guild.users[userId]) {
+    guild.users[userId] = defaultUser();
+    scheduleSave();
+  }
+
+  return guild.users[userId];
+}
 
 // ============================================================
-// UTILIDADES
+// MEMORY
 // ============================================================
 
-const COLOR = 0xE8A7FF;
-const DARK = 0x8E44AD;
+const messageCache = new Map();
+const spamTracker = new Map();
+const xpCooldown = new Map();
+const commandCooldowns = new Map();
 
-function embed(title, description = "") {
+function cacheMessage(message) {
+  if (!message.guild) return;
+
+  if (!messageCache.has(message.guild.id)) {
+    messageCache.set(message.guild.id, new Map());
+  }
+
+  const cache = messageCache.get(message.guild.id);
+
+  cache.set(message.id, {
+    authorId: message.author?.id,
+    authorTag: message.author?.tag,
+    channelId: message.channel?.id,
+    content: message.content || "",
+    createdAt: Date.now()
+  });
+
+  if (cache.size > 500) {
+    const first = cache.keys().next().value;
+    cache.delete(first);
+  }
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function embed(title, description) {
   return new EmbedBuilder()
-    .setColor(COLOR)
+    .setColor(0xE8A7FF)
     .setTitle(title)
     .setDescription(description)
     .setTimestamp();
@@ -143,122 +200,126 @@ function embed(title, description = "") {
 
 function errorEmbed(text) {
   return new EmbedBuilder()
-    .setColor(0xFF4D6D)
+    .setColor(0xFF3B3B)
     .setTitle("❌ Error")
-    .setDescription(text);
+    .setDescription(text)
+    .setTimestamp();
 }
 
-function successEmbed(text) {
+function successEmbed(title, text) {
   return new EmbedBuilder()
-    .setColor(0x57F287)
-    .setTitle("✅ Madokami")
-    .setDescription(text);
+    .setColor(0x9DFFB0)
+    .setTitle(`🌸 ${title}`)
+    .setDescription(text)
+    .setTimestamp();
 }
 
-function money(n) {
-  return `${Number(n || 0).toLocaleString("es-ES")} 💰`;
+function random(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-function mentionUser(message, args) {
-  const member = message.mentions.members.first();
+function formatMoney(number) {
+  return `${Number(number).toLocaleString("es-ES")} 💰`;
+}
 
-  if (member) return member;
+function getLevel(xp) {
+  return Math.floor(Math.sqrt(xp / 100)) + 1;
+}
 
-  const id = args[0]?.replace(/[<@!>]/g, "");
+function xpForLevel(level) {
+  return Math.pow(level - 1, 2) * 100;
+}
 
-  if (id && /^\d{17,20}$/.test(id)) {
-    return message.guild.members.cache.get(id) || null;
+function xpForNextLevel(level) {
+  return Math.pow(level, 2) * 100;
+}
+
+function progressBar(current, total, size = 12) {
+  if (total <= 0) return "████████████";
+
+  const percent = Math.max(0, Math.min(1, current / total));
+  const filled = Math.round(percent * size);
+
+  return "█".repeat(filled) + "░".repeat(size - filled);
+}
+
+function isAdmin(member) {
+  return member.permissions.has(
+    PermissionsBitField.Flags.Administrator
+  );
+}
+
+function mentionedUser(message) {
+  return message.mentions.users.first();
+}
+
+function mentionedMember(message) {
+  return message.mentions.members.first();
+}
+
+function stripMention(text) {
+  return text.replace(/[<@!>]/g, "");
+}
+
+async function sendLong(message, text) {
+  if (!text) return;
+
+  const chunks = [];
+
+  for (let i = 0; i < text.length; i += 1900) {
+    chunks.push(text.slice(i, i + 1900));
   }
+
+  for (const chunk of chunks) {
+    await message.channel.send({
+      content: chunk,
+      allowedMentions: { parse: [] }
+    });
+  }
+}
+
+function containsLink(text) {
+  return /(https?:\/\/|www\.|discord\.gg\/|discord\.com\/invite\/)/i.test(text);
+}
+
+function parseDuration(input) {
+  if (!input) return null;
+
+  const match = /^(\d+)(s|m|h|d)$/i.exec(input);
+
+  if (!match) return null;
+
+  const value = Number(match[1]);
+  const unit = match[2].toLowerCase();
+
+  if (unit === "s") return value * 1000;
+  if (unit === "m") return value * 60 * 1000;
+  if (unit === "h") return value * 60 * 60 * 1000;
+  if (unit === "d") return value * 24 * 60 * 60 * 1000;
 
   return null;
 }
 
-function isAdmin(member) {
-  return member.permissions.has(PermissionsBitField.Flags.Administrator);
-}
-
-function hasPermission(member, permission) {
-  return member.permissions.has(permission);
-}
-
-function reasonFrom(args, start = 1) {
-  return args.slice(start).join(" ") || "Sin razón especificada";
-}
-
-function truncate(text, max = 900) {
-  text = String(text ?? "");
-  return text.length > max ? text.slice(0, max - 3) + "..." : text;
-}
-
-function formatDuration(ms) {
-  let seconds = Math.floor(ms / 1000);
-
-  const d = Math.floor(seconds / 86400);
-  seconds %= 86400;
-
-  const h = Math.floor(seconds / 3600);
-  seconds %= 3600;
-
-  const m = Math.floor(seconds / 60);
-  seconds %= 60;
-
-  const parts = [];
-
-  if (d) parts.push(`${d}d`);
-  if (h) parts.push(`${h}h`);
-  if (m) parts.push(`${m}m`);
-  if (seconds) parts.push(`${seconds}s`);
-
-  return parts.join(" ") || "0s";
-}
-
-function addTransaction(user, text, amount) {
-  user.transactions.unshift({
-    text,
-    amount,
-    at: Date.now()
-  });
-
-  user.transactions = user.transactions.slice(0, 20);
-}
-
-function addXP(guildId, userId, amount) {
-  const u = userData(guildId, userId);
-
-  u.xp += amount;
-
-  let needed = u.level * 100;
-
-  while (u.xp >= needed) {
-    u.xp -= needed;
-    u.level++;
-    needed = u.level * 100;
-  }
-
-  saveDB();
-
-  return u.level;
-}
-
-function cooldown(user, key, ms) {
+function getCooldown(key, seconds) {
   const now = Date.now();
+  const last = commandCooldowns.get(key) || 0;
+  const remaining = seconds * 1000 - (now - last);
 
-  if (!user[key]) {
-    user[key] = now;
-    return true;
+  if (remaining > 0) {
+    return Math.ceil(remaining / 1000);
   }
 
-  if (now - user[key] < ms) {
-    return false;
-  }
-
-  user[key] = now;
-  return true;
+  commandCooldowns.set(key, now);
+  return 0;
 }
 
-async function sendLog(guild, title, description, color = COLOR) {
+// ============================================================
+// LOGS
+// ============================================================
+
+async function sendLog(guild, title, description, color = 0xE8A7FF) {
   try {
-    const data = guildData(guild.id);
+    const data = getGuild(guild.id);
     const channelId = data.config.logChannel;
 
     if (!channelId) return;
@@ -267,20 +328,41 @@ async function sendLog(guild, title, description, color = COLOR) {
 
     if (!channel || !channel.isTextBased()) return;
 
-    const text = truncate(description, 3800);
+    const logEmbed = new EmbedBuilder()
+      .setColor(color)
+      .setTitle(`📋 ${title}`)
+      .setDescription(description.slice(0, 4000))
+      .setTimestamp();
 
     await channel.send({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(color)
-          .setTitle(title)
-          .setDescription(text)
-          .setTimestamp()
-      ]
+      embeds: [logEmbed]
     });
-  } catch (err) {
-    console.error("Error en logs:", err);
+  } catch (error) {
+    console.error("Error enviando log:", error);
   }
+}
+
+// ============================================================
+// XP
+// ============================================================
+
+function addXP(guildId, userId, amount) {
+  const user = getUser(guildId, userId);
+
+  const oldLevel = getLevel(user.xp);
+
+  user.xp += amount;
+
+  const newLevel = getLevel(user.xp);
+
+  scheduleSave();
+
+  return {
+    amount,
+    oldLevel,
+    newLevel,
+    leveledUp: newLevel > oldLevel
+  };
 }
 
 // ============================================================
@@ -288,2134 +370,1437 @@ async function sendLog(guild, title, description, color = COLOR) {
 // ============================================================
 
 const commands = new Map();
-const categories = {
-  "💰 Economía": [],
-  "🎮 Diversión": [],
-  "👥 Social": [],
-  "⭐ Niveles": [],
-  "📚 Información": [],
-  "🛠️ Utilidades": [],
-  "🌸 Madokami": [],
-  "🤖 IA": []
-};
 
-function register(category, names, handler, description = "") {
-  if (!Array.isArray(names)) names = [names];
-
+function command(names, handler) {
   for (const name of names) {
-    commands.set(name, {
-      name,
-      category,
-      handler,
-      description
-    });
-
-    if (categories[category] && !categories[category].includes(name)) {
-      categories[category].push(name);
-    }
+    commands.set(name.toLowerCase(), handler);
   }
 }
 
 // ============================================================
-// 💰 ECONOMÍA — 25
+// PUBLIC CATEGORIES
 // ============================================================
 
-register("💰 Economía", "balance", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
+const PUBLIC_COMMANDS = {
+  "💰 Economía": [
+    "balance",
+    "work",
+    "daily",
+    "pay",
+    "give",
+    "deposit",
+    "withdraw",
+    "bank",
+    "money",
+    "wallet",
+    "cash",
+    "coins",
+    "wealth",
+    "job",
+    "salary",
+    "income",
+    "transactions",
+    "financial",
+    "economyinfo",
+    "richest",
+    "moneyleaderboard",
+    "savings",
+    "moneystats",
+    "budget",
+    "economy"
+  ],
 
-  return m.reply({
+  "🎮 Diversión": [
+    "8ball",
+    "coinflip",
+    "dice",
+    "roll",
+    "choose",
+    "joke",
+    "hug",
+    "pat",
+    "trivia",
+    "guess",
+    "random",
+    "rate",
+    "magic",
+    "fortune",
+    "hello",
+    "fact",
+    "quote",
+    "compliment",
+    "roast",
+    "emoji",
+    "color",
+    "number",
+    "reverse",
+    "scramble",
+    "riddle"
+  ],
+
+  "💬 Social": [
+    "profile",
+    "social",
+    "say",
+    "whois",
+    "goodnight",
+    "goodmorning",
+    "highfive",
+    "wave",
+    "clap",
+    "smile",
+    "goodluck",
+    "thanks",
+    "support",
+    "greet",
+    "friend",
+    "welcome",
+    "activity",
+    "messages",
+    "socialstats",
+    "joined",
+    "account",
+    "bio",
+    "setbio",
+    "clearbio",
+    "userinfo"
+  ],
+
+  "⭐ Niveles": [
+    "level",
+    "xp",
+    "rank",
+    "levels",
+    "nextlevel",
+    "myrank",
+    "topxp",
+    "levelinfo",
+    "progress",
+    "xprequired",
+    "xpneeded",
+    "levelstats",
+    "levelcheck",
+    "mylevel",
+    "myxp",
+    "xprank",
+    "toplevels",
+    "progressbar",
+    "levelcard",
+    "xpstats",
+    "rankinfo",
+    "levelboard",
+    "messagesxp",
+    "xppermessage",
+    "levelgoal"
+  ],
+
+  "ℹ️ Información": [
+    "serverinfo",
+    "avatar",
+    "id",
+    "roles",
+    "channels",
+    "members",
+    "icon",
+    "created",
+    "owner",
+    "boost",
+    "rolescount",
+    "channelcount",
+    "botinfo",
+    "membercount",
+    "rolecount",
+    "channelinfo",
+    "serverid",
+    "servericon",
+    "serverowner",
+    "memberinfo",
+    "botstats",
+    "guild",
+    "information",
+    "permissions"
+  ],
+
+  "🛠️ Utilidades": [
+    "ping",
+    "poll",
+    "remind",
+    "time",
+    "timestamp",
+    "invite",
+    "sayembed",
+    "uptime",
+    "calc",
+    "charcount",
+    "wordcount",
+    "uppercase",
+    "lowercase",
+    "repeat",
+    "firstword",
+    "lastword",
+    "length",
+    "serverstats",
+    "roleinfo",
+    "snowflake",
+    "channelinfo",
+    "permissions",
+    "textinfo",
+    "math",
+    "utility"
+  ],
+
+  "🌸 Madokami": [
+    "about",
+    "prefix",
+    "commands",
+    "status",
+    "server",
+    "bot",
+    "hello",
+    "version",
+    "statusbot",
+    "uptimebot",
+    "stats",
+    "commandsinfo",
+    "github",
+    "developer",
+    "support",
+    "pingbot",
+    "servers",
+    "users",
+    "channelsbot",
+    "latency",
+    "library",
+    "node",
+    "runtime",
+    "memory",
+    "config"
+  ],
+
+  "🤖 IA": [
+    "ia",
+    "ask",
+    "imagen"
+  ]
+};
+
+// ============================================================
+// 💰 ECONOMÍA
+// ============================================================
+
+command(["balance", "money", "wallet", "cash", "coins"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
+
+  await message.reply({
     embeds: [
       embed(
-        "💰 Tu balance",
-        `**Billetera:** ${money(u.wallet)}\n**Banco:** ${money(u.bank)}\n**Total:** ${money(u.wallet + u.bank)}`
+        "💰 Tu economía",
+        `**Billetera:** ${formatMoney(user.wallet)}\n` +
+        `**Banco:** ${formatMoney(user.bank)}\n\n` +
+        `💎 **Patrimonio:** ${formatMoney(user.wallet + user.bank)}`
       )
     ]
   });
-}, "Muestra tu dinero.");
+});
 
-register("💰 Economía", "work", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
+command(["work", "job"], async (message) => {
+  const key = `${message.guild.id}:${message.author.id}:work`;
+  const remaining = getCooldown(key, 30);
 
-  if (!cooldown(u, "workAt", 30000)) {
-    return m.reply({
-      embeds: [errorEmbed("⏳ Debes esperar 30 segundos para volver a trabajar.")]
-    });
+  if (remaining) {
+    return message.reply(`⏳ Espera **${remaining}s** para volver a trabajar.`);
   }
 
-  const amount = Math.floor(Math.random() * 201) + 100;
+  const user = getUser(message.guild.id, message.author.id);
+  const amount = random(100, 300);
 
-  u.wallet += amount;
-  u.earned += amount;
+  user.wallet += amount;
+  scheduleSave();
 
-  addTransaction(u, "Trabajo", amount);
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`💼 Trabajaste y ganaste **${money(amount)}**.`)
-    ]
-  });
-}, "Trabaja y gana dinero.");
-
-register("💰 Economía", "daily", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  if (!cooldown(u, "dailyAt", 86400000)) {
-    const remaining = 86400000 - (Date.now() - u.dailyAt);
-
-    return m.reply({
-      embeds: [
-        errorEmbed(`⏳ Tu recompensa diaria estará disponible en **${formatDuration(remaining)}**.`)
-      ]
-    });
-  }
-
-  const amount = 500;
-
-  u.wallet += amount;
-  u.earned += amount;
-
-  addTransaction(u, "Recompensa diaria", amount);
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`🎁 Recibiste tu recompensa diaria: **${money(amount)}**.`)
-    ]
-  });
-}, "Recompensa diaria.");
-
-register("💰 Economía", "pay", async (m, args) => {
-  const target = mentionUser(m, args);
-
-  if (!target || target.id === m.author.id) {
-    return m.reply({
-      embeds: [errorEmbed("Usa `m!pay @usuario cantidad`.")]
-    });
-  }
-
-  const amount = Number(args[1]);
-
-  if (!Number.isInteger(amount) || amount <= 0) {
-    return m.reply({
-      embeds: [errorEmbed("La cantidad debe ser un número positivo.")]
-    });
-  }
-
-  const sender = userData(m.guild.id, m.author.id);
-  const receiver = userData(m.guild.id, target.id);
-
-  if (sender.wallet < amount) {
-    return m.reply({
-      embeds: [errorEmbed("No tienes suficiente dinero.")]
-    });
-  }
-
-  sender.wallet -= amount;
-  sender.spent += amount;
-  receiver.wallet += amount;
-  receiver.earned += amount;
-
-  addTransaction(sender, `Pago a ${target.user.tag}`, -amount);
-  addTransaction(receiver, `Pago de ${m.author.tag}`, amount);
-
-  saveDB();
-
-  return m.reply({
+  await message.reply({
     embeds: [
       successEmbed(
-        `💸 ${m.author} envió **${money(amount)}** a ${target}.`
+        "Trabajo completado",
+        `Trabajaste y recibiste **${formatMoney(amount)}**.\n\n` +
+        `💰 Ahora tienes ${formatMoney(user.wallet)}.`
       )
     ]
   });
-}, "Envía dinero a otro usuario.");
+});
 
-register("💰 Economía", "give", async (m, args) => {
-  const target = mentionUser(m, args);
+command(["daily"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
+  const now = Date.now();
 
-  if (!target) {
-    return m.reply({
-      embeds: [errorEmbed("Usa `m!give @usuario cantidad`.")]
-    });
+  if (now - user.daily < 24 * 60 * 60 * 1000) {
+    const remaining = Math.ceil(
+      (24 * 60 * 60 * 1000 - (now - user.daily)) / 3600000
+    );
+
+    return message.reply(`⏳ Tu recompensa diaria vuelve en aproximadamente **${remaining}h**.`);
   }
 
-  const amount = Number(args[1]);
+  const amount = random(1000, 2000);
 
-  if (!Number.isInteger(amount) || amount <= 0) {
-    return m.reply({
-      embeds: [errorEmbed("Cantidad inválida.")]
-    });
+  user.wallet += amount;
+  user.daily = now;
+
+  scheduleSave();
+
+  await message.reply({
+    embeds: [
+      successEmbed(
+        "Recompensa diaria",
+        `Recibiste **${formatMoney(amount)}**.`
+      )
+    ]
+  });
+});
+
+command(["pay", "give"], async (message) => {
+  const target = mentionedUser(message);
+  const amount = Number(message.args?.[1]);
+
+  if (!target || !Number.isFinite(amount) || amount <= 0) {
+    return message.reply("❌ Uso: `m!pay @usuario cantidad`");
   }
 
-  const sender = userData(m.guild.id, m.author.id);
-  const receiver = userData(m.guild.id, target.id);
+  if (target.bot) {
+    return message.reply("❌ No puedes pagarle a un bot.");
+  }
+
+  const sender = getUser(message.guild.id, message.author.id);
+  const receiver = getUser(message.guild.id, target.id);
 
   if (sender.wallet < amount) {
-    return m.reply({
-      embeds: [errorEmbed("No tienes suficiente dinero.")]
-    });
+    return message.reply("❌ No tienes suficiente dinero.");
   }
 
   sender.wallet -= amount;
   receiver.wallet += amount;
 
-  sender.spent += amount;
-  receiver.earned += amount;
+  scheduleSave();
 
-  addTransaction(sender, `Transferencia a ${target.user.tag}`, -amount);
-  addTransaction(receiver, `Transferencia de ${m.author.tag}`, amount);
-
-  saveDB();
-
-  return m.reply({
+  await message.reply({
     embeds: [
-      successEmbed(`🎁 Transferiste ${money(amount)} a ${target}.`)
+      successEmbed(
+        "Transferencia",
+        `${message.author} envió **${formatMoney(amount)}** a ${target}.`
+      )
     ]
   });
-}, "Transfiere dinero.");
+});
 
-register("💰 Economía", "deposit", async (m, args) => {
-  const u = userData(m.guild.id, m.author.id);
+command(["deposit"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
+  const amount = Number(message.args?.[1]);
 
-  let amount = args[0] === "all" ? u.wallet : Number(args[0]);
-
-  if (!Number.isInteger(amount) || amount <= 0 || amount > u.wallet) {
-    return m.reply({
-      embeds: [errorEmbed("Cantidad inválida.")]
-    });
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return message.reply("❌ Uso: `m!deposit cantidad`");
   }
 
-  u.wallet -= amount;
-  u.bank += amount;
-
-  addTransaction(u, "Depósito bancario", 0);
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`🏦 Depositaste **${money(amount)}** en el banco.`)
-    ]
-  });
-}, "Deposita dinero.");
-
-register("💰 Economía", "withdraw", async (m, args) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  let amount = args[0] === "all" ? u.bank : Number(args[0]);
-
-  if (!Number.isInteger(amount) || amount <= 0 || amount > u.bank) {
-    return m.reply({
-      embeds: [errorEmbed("Cantidad inválida.")]
-    });
+  if (user.wallet < amount) {
+    return message.reply("❌ No tienes esa cantidad en la billetera.");
   }
 
-  u.bank -= amount;
-  u.wallet += amount;
+  user.wallet -= amount;
+  user.bank += amount;
 
-  addTransaction(u, "Retiro bancario", 0);
-  saveDB();
+  scheduleSave();
 
-  return m.reply({
-    embeds: [
-      successEmbed(`🏧 Retiraste **${money(amount)}**.`)
-    ]
-  });
-}, "Retira dinero del banco.");
+  await message.reply(`🏦 Depositaste **${formatMoney(amount)}**.`);
+});
 
-register("💰 Economía", "bank", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
+command(["withdraw"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
+  const amount = Number(message.args?.[1]);
 
-  return m.reply({
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return message.reply("❌ Uso: `m!withdraw cantidad`");
+  }
+
+  if (user.bank < amount) {
+    return message.reply("❌ No tienes esa cantidad en el banco.");
+  }
+
+  user.bank -= amount;
+  user.wallet += amount;
+
+  scheduleSave();
+
+  await message.reply(`🏦 Retiraste **${formatMoney(amount)}**.`);
+});
+
+command(["bank"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
+
+  await message.reply(
+    `🏦 Tienes **${formatMoney(user.bank)}** guardados en el banco.`
+  );
+});
+
+command(["salary", "income"], async (message) => {
+  const key = `${message.guild.id}:${message.author.id}:salary`;
+  const remaining = getCooldown(key, 1800);
+
+  if (remaining) {
+    return message.reply(`⏳ Tu próximo salario estará disponible en **${Math.ceil(remaining / 60)} minutos**.`);
+  }
+
+  const user = getUser(message.guild.id, message.author.id);
+  const amount = random(500, 800);
+
+  user.wallet += amount;
+  user.salary = Date.now();
+
+  scheduleSave();
+
+  await message.reply(`💼 Recibiste un salario de **${formatMoney(amount)}**.`);
+});
+
+command(["wealth", "savings"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
+
+  await message.reply(
+    `💎 Tu patrimonio total es **${formatMoney(user.wallet + user.bank)}**.`
+  );
+});
+
+command(["transactions", "financial", "moneystats", "budget", "economy", "economyinfo"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
+
+  await message.reply({
     embeds: [
       embed(
-        "🏦 Banco",
-        `Dinero guardado: **${money(u.bank)}**`
+        "💰 Estadísticas económicas",
+        `💵 Billetera: ${formatMoney(user.wallet)}\n` +
+        `🏦 Banco: ${formatMoney(user.bank)}\n` +
+        `💎 Total: ${formatMoney(user.wallet + user.bank)}`
       )
     ]
   });
-}, "Muestra tu banco.");
+});
 
-register("💰 Economía", "savings", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
+command(["richest", "moneyleaderboard"], async (message) => {
+  const guild = getGuild(message.guild.id);
 
-  return m.reply({
-    embeds: [
-      embed(
-        "💎 Ahorros",
-        `Tus ahorros actuales son **${money(u.bank)}**.`
-      )
-    ]
-  });
-}, "Muestra tus ahorros.");
-
-register("💰 Economía", "money", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "💰 Dinero",
-        `Tienes **${money(u.wallet)}** disponibles.`
-      )
-    ]
-  });
-}, "Muestra tu dinero.");
-
-register("💰 Economía", "wallet", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "👛 Billetera",
-        `Billetera: **${money(u.wallet)}**`
-      )
-    ]
-  });
-}, "Muestra tu billetera.");
-
-register("💰 Economía", "cash", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "💵 Efectivo",
-        `Efectivo disponible: **${money(u.wallet)}**`
-      )
-    ]
-  });
-}, "Muestra tu efectivo.");
-
-register("💰 Economía", "coins", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "🪙 Monedas",
-        `Monedas totales: **${money(u.wallet + u.bank)}**`
-      )
-    ]
-  });
-}, "Muestra tus monedas.");
-
-register("💰 Economía", "wealth", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "💎 Patrimonio",
-        `Tu patrimonio total es **${money(u.wallet + u.bank)}**.`
-      )
-    ]
-  });
-}, "Muestra tu patrimonio.");
-
-register("💰 Economía", "job", async (m) => {
-  const jobs = [
-    "Programador",
-    "Diseñador",
-    "Arquitecto",
-    "Chef",
-    "Fotógrafo",
-    "Desarrollador",
-    "Artista",
-    "Músico"
-  ];
-
-  const job = jobs[m.author.id.length % jobs.length];
-
-  return m.reply({
-    embeds: [
-      embed(
-        "💼 Tu profesión",
-        `Tu profesión actual es **${job}**.`
-      )
-    ]
-  });
-}, "Muestra tu profesión.");
-
-register("💰 Economía", "salary", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "💵 Salario",
-        `Tu salario por trabajo está entre **100 y 300 💰**.`
-      )
-    ]
-  });
-}, "Muestra tu salario.");
-
-register("💰 Economía", "income", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "📈 Ingresos",
-        `Has ganado aproximadamente **${money(u.earned)}**.`
-      )
-    ]
-  });
-}, "Muestra tus ingresos.");
-
-register("💰 Economía", "transactions", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  const list = u.transactions.length
-    ? u.transactions
-        .slice(0, 10)
-        .map((x, i) => `${i + 1}. ${x.text}`)
-        .join("\n")
-    : "No tienes transacciones.";
-
-  return m.reply({
-    embeds: [
-      embed("📜 Transacciones", list)
-    ]
-  });
-}, "Muestra tus últimas transacciones.");
-
-register("💰 Economía", "financial", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "📊 Resumen financiero",
-        `💰 Billetera: **${money(u.wallet)}**\n` +
-        `🏦 Banco: **${money(u.bank)}**\n` +
-        `📈 Ganado: **${money(u.earned)}**\n` +
-        `📉 Gastado: **${money(u.spent)}**`
-      )
-    ]
-  });
-}, "Resumen financiero.");
-
-register("💰 Economía", "economyinfo", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "💰 Economía de Madokami",
-        "Puedes trabajar, reclamar recompensas, guardar dinero en el banco y transferir dinero a otros usuarios.\n\n" +
-        "Madokami utiliza únicamente moneda virtual del servidor."
-      )
-    ]
-  });
-}, "Información de la economía.");
-
-register("💰 Economía", "richest", async (m) => {
-  const users = Object.entries(guildData(m.guild.id).users)
-    .sort((a, b) =>
-      (b[1].wallet + b[1].bank) -
-      (a[1].wallet + a[1].bank)
-    )
+  const ranking = Object.entries(guild.users)
+    .map(([id, user]) => ({
+      id,
+      total: (user.wallet || 0) + (user.bank || 0)
+    }))
+    .sort((a, b) => b.total - a.total)
     .slice(0, 10);
 
-  const text = users.length
-    ? users.map((x, i) =>
-        `**${i + 1}.** <@${x[0]}> — ${money(x[1].wallet + x[1].bank)}`
-      ).join("\n")
-    : "Todavía no hay datos.";
+  if (!ranking.length) {
+    return message.reply("💰 Todavía no hay datos económicos.");
+  }
 
-  return m.reply({
-    embeds: [embed("👑 Usuarios más ricos", text)]
-  });
-}, "Ranking de riqueza.");
+  const lines = ranking.map(
+    (x, i) =>
+      `**${i + 1}.** <@${x.id}> — ${formatMoney(x.total)}`
+  );
 
-register("💰 Economía", "leaderboard", async (m) => {
-  const users = Object.entries(guildData(m.guild.id).users)
-    .sort((a, b) => b[1].wallet - a[1].wallet)
-    .slice(0, 10);
-
-  const text = users.length
-    ? users.map((x, i) =>
-        `**${i + 1}.** <@${x[0]}> — ${money(x[1].wallet)}`
-      ).join("\n")
-    : "No hay datos.";
-
-  return m.reply({
-    embeds: [embed("🏆 Ranking económico", text)]
-  });
-}, "Ranking económico.");
-
-register("💰 Economía", "moneystats", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
+  await message.reply({
     embeds: [
-      embed(
-        "📊 Estadísticas económicas",
-        `💰 Total: **${money(u.wallet + u.bank)}**\n` +
-        `📈 Ganado: **${money(u.earned)}**\n` +
-        `📉 Gastado: **${money(u.spent)}**\n` +
-        `📜 Transacciones: **${u.transactions.length}**`
-      )
+      embed("🏆 Personas con más dinero", lines.join("\n"))
     ]
   });
-}, "Estadísticas económicas.");
+});
 
 // ============================================================
-// 🎮 DIVERSIÓN — 25
+// 🎮 DIVERSIÓN
 // ============================================================
 
-register("🎮 Diversión", "8ball", async (m, args) => {
-  if (!args.length) return m.reply("❓ Haz una pregunta.");
-
+command(["8ball"], async (message) => {
   const answers = [
-    "Sí.",
-    "No.",
-    "Probablemente.",
-    "No estoy seguro.",
-    "Definitivamente.",
+    "Sí, definitivamente.",
+    "No parece probable.",
     "Puede ser.",
-    "Las posibilidades son altas.",
-    "Pregunta más tarde."
+    "Las estrellas dicen que sí.",
+    "No estoy seguro.",
+    "Pregunta nuevamente."
   ];
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🎱 Bola mágica",
-        answers[Math.floor(Math.random() * answers.length)]
-      )
-    ]
-  });
-}, "Pregunta a la bola mágica.");
+  await message.reply(`🔮 ${answers[random(0, answers.length - 1)]}`);
+});
 
-register("🎮 Diversión", "coinflip", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🪙 Moneda",
-        Math.random() < 0.5 ? "🟣 Cara" : "⚪ Cruz"
-      )
-    ]
-  });
-}, "Lanza una moneda virtual.");
+command(["coinflip"], async (message) => {
+  await message.reply(
+    `🪙 Cayó **${Math.random() < 0.5 ? "cara" : "cruz"}**.`
+  );
+});
 
-register("🎮 Diversión", "dice", async (m, args) => {
-  let sides = Number(args[0]) || 6;
+command(["dice", "roll"], async (message) => {
+  const sides = Math.min(
+    Math.max(Number(message.args?.[1]) || 6, 2),
+    100
+  );
 
-  if (sides < 2 || sides > 1000) sides = 6;
+  await message.reply(`🎲 Resultado: **${random(1, sides)}** / ${sides}`);
+});
 
-  const result = Math.floor(Math.random() * sides) + 1;
-
-  return m.reply({
-    embeds: [
-      embed("🎲 Dado", `Resultado: **${result}** / ${sides}`)
-    ]
-  });
-}, "Tira un dado.");
-
-register("🎮 Diversión", "roll", async (m, args) => {
-  let max = Number(args[0]) || 100;
-
-  if (max < 1 || max > 1000000) max = 100;
-
-  const result = Math.floor(Math.random() * max) + 1;
-
-  return m.reply({
-    embeds: [
-      embed("🎲 Roll", `Resultado: **${result}**`)
-    ]
-  });
-}, "Número aleatorio.");
-
-register("🎮 Diversión", "choose", async (m, args) => {
-  const text = args.join(" ");
-
-  const options = text
-    .split("|")
-    .map(x => x.trim())
-    .filter(Boolean);
+command(["choose"], async (message) => {
+  const options = message.args?.slice(1) || [];
 
   if (options.length < 2) {
-    return m.reply("Usa `m!choose pizza | hamburguesa`.");
+    return message.reply("❌ Uso: `m!choose pizza hamburguesa`");
   }
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🤔 Elección",
-        `Elegí: **${options[Math.floor(Math.random() * options.length)]}**`
-      )
-    ]
-  });
-}, "Elige entre opciones.");
+  await message.reply(
+    `🎯 Elijo: **${options[random(0, options.length - 1)]}**`
+  );
+});
 
-register("🎮 Diversión", "joke", async (m) => {
+command(["joke"], async (message) => {
   const jokes = [
     "¿Qué hace una abeja en el gimnasio? ¡Zum-ba!",
-    "¿Qué le dice un techo a otro? Techo de menos.",
-    "¿Cuál es el colmo de un jardinero? Que siempre lo dejen plantado.",
-    "¿Qué hace una computadora cuando tiene frío? Cierra Windows."
+    "¿Qué le dijo un byte a otro? Nos vemos en el siguiente ciclo.",
+    "¿Por qué el ordenador fue al médico? Porque tenía un virus."
   ];
 
-  return m.reply({
-    embeds: [
-      embed("😂 Chiste", jokes[Math.floor(Math.random() * jokes.length)])
-    ]
-  });
-}, "Cuenta un chiste.");
+  await message.reply(`😂 ${jokes[random(0, jokes.length - 1)]}`);
+});
 
-register("🎮 Diversión", "hug", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+command(["hug", "pat"], async (message) => {
+  const target = mentionedUser(message) || message.author;
 
-  return m.reply({
-    embeds: [
-      embed("🫂 Abrazo", `${m.author} le da un abrazo a ${target}.`)
-    ]
-  });
-}, "Envía un abrazo.");
+  await message.reply(
+    `🌸 ${message.author} le manda un gesto amistoso a ${target}.`
+  );
+});
 
-register("🎮 Diversión", "pat", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("🌸 Pat", `${m.author} le da una palmadita a ${target}.`)
-    ]
-  });
-}, "Da una palmadita.");
-
-register("🎮 Diversión", "trivia", async (m) => {
+command(["trivia"], async (message) => {
   const questions = [
-    ["¿Cuál es el planeta más grande?", ["Mercurio", "Júpiter", "Marte"], "Júpiter"],
-    ["¿Cuántos continentes hay?", ["5", "6", "7"], "7"],
-    ["¿Cuál es el océano más grande?", ["Atlántico", "Pacífico", "Índico"], "Pacífico"],
-    ["¿Qué gas respiramos principalmente?", ["Oxígeno", "Nitrógeno", "Helio"], "Nitrógeno"]
+    ["¿Cuál es el planeta más grande del sistema solar?", "Júpiter"],
+    ["¿Cuántos lados tiene un hexágono?", "6"],
+    ["¿Cuál es la capital de Francia?", "París"],
+    ["¿Qué gas respiramos principalmente del aire?", "Nitrógeno"]
   ];
 
-  const q = questions[Math.floor(Math.random() * questions.length)];
+  const q = questions[random(0, questions.length - 1)];
 
-  return m.reply({
+  await message.reply({
     embeds: [
       embed(
         "🧠 Trivia",
-        `**${q[0]}**\n\n${q[1].map((x, i) => `${i + 1}. ${x}`).join("\n")}\n\nRespuesta: **${q[2]}**`
+        `**Pregunta:** ${q[0]}\n\n💡 Respuesta: ||${q[1]}||`
       )
     ]
   });
-}, "Pregunta de trivia.");
+});
 
-register("🎮 Diversión", "guess", async (m) => {
-  const n = Math.floor(Math.random() * 10) + 1;
+command(["guess"], async (message) => {
+  const guess = Number(message.args?.[1]);
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🔢 Adivina",
-        `Estoy pensando en un número del **1 al 10**.\n\nMi número era: **${n}**.`
-      )
-    ]
-  });
-}, "Juego de adivinanza.");
+  if (!Number.isInteger(guess) || guess < 1 || guess > 10) {
+    return message.reply("❌ Adivina un número del **1 al 10**.");
+  }
 
-register("🎮 Diversión", "random", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🎲 Random",
-        `Tu número aleatorio es **${Math.floor(Math.random() * 100) + 1}**.`
-      )
-    ]
-  });
-}, "Genera algo aleatorio.");
+  const number = random(1, 10);
 
-register("🎮 Diversión", "rate", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-  const score = Math.floor(Math.random() * 101);
+  await message.reply(
+    guess === number
+      ? `🎯 ¡Acertaste! Era **${number}**.`
+      : `❌ No era. Salió **${number}**.`
+  );
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "📊 Valoración",
-        `${target} recibió una valoración aleatoria de **${score}/100**.`
-      )
-    ]
-  });
-}, "Valoración divertida.");
+command(["random", "number"], async (message) => {
+  await message.reply(`🎲 Número aleatorio: **${random(1, 100)}**`);
+});
 
-register("🎮 Diversión", "magic", async (m) => {
+command(["rate"], async (message) => {
+  const target = mentionedUser(message) || message.author;
+
+  await message.reply(
+    `⭐ La energía de ${target} hoy está en **${random(1, 100)}%**.`
+  );
+});
+
+command(["magic", "fortune"], async (message) => {
   const answers = [
-    "✨ La magia está de tu lado.",
-    "🌙 El futuro es incierto.",
-    "🌸 Algo interesante podría ocurrir.",
-    "⭐ Sigue adelante."
+    "✨ Algo interesante podría ocurrir pronto.",
+    "🌸 Hoy es un buen día para aprender algo nuevo.",
+    "🔮 Tu próximo paso depende de tus decisiones.",
+    "💫 Sigue avanzando."
   ];
 
-  return m.reply({
-    embeds: [
-      embed("🔮 Magia", answers[Math.floor(Math.random() * answers.length)])
-    ]
-  });
-}, "Mensaje mágico.");
+  await message.reply(
+    answers[random(0, answers.length - 1)]
+  );
+});
 
-register("🎮 Diversión", "fortune", async (m) => {
-  const fortunes = [
-    "Hoy aprenderás algo nuevo.",
-    "Una buena sorpresa podría aparecer.",
-    "Tu esfuerzo tendrá recompensa.",
-    "No abandones tus objetivos."
-  ];
+command(["hello"], async (message) => {
+  await message.reply("🌸 ¡Hola! Soy **Madokami**.");
+});
 
-  return m.reply({
-    embeds: [
-      embed("🔮 Fortuna", fortunes[Math.floor(Math.random() * fortunes.length)])
-    ]
-  });
-}, "Fortuna.");
-
-register("🎮 Diversión", "hello", async (m) => {
-  return m.reply({
-    embeds: [
-      embed("👋 Hola", `¡Hola ${m.author}! 🌸`)
-    ]
-  });
-}, "Saluda.");
-
-register("🎮 Diversión", "fact", async (m) => {
+command(["fact"], async (message) => {
   const facts = [
-    "Los pulpos tienen tres corazones.",
-    "La luz del Sol tarda unos 8 minutos en llegar a la Tierra.",
-    "Los tiburones existen desde antes que los árboles.",
-    "La miel puede conservarse durante muchísimo tiempo."
+    "🐙 Los pulpos tienen tres corazones.",
+    "🌍 La Tierra gira sobre su eje aproximadamente cada 24 horas.",
+    "🦋 Las mariposas prueban sabores mediante sensores en sus patas."
   ];
 
-  return m.reply({
-    embeds: [
-      embed("🧠 Dato curioso", facts[Math.floor(Math.random() * facts.length)])
-    ]
-  });
-}, "Dato curioso.");
+  await message.reply(`🧠 ${facts[random(0, facts.length - 1)]}`);
+});
 
-register("🎮 Diversión", "quote", async (m) => {
+command(["quote"], async (message) => {
   const quotes = [
-    "Cada día es una nueva oportunidad.",
-    "La práctica mejora tus habilidades.",
-    "Los pequeños avances también cuentan.",
-    "Aprender es avanzar."
+    "🌸 Cada pequeño paso cuenta.",
+    "✨ Aprender también es avanzar.",
+    "💫 La constancia puede cambiar muchas cosas."
   ];
 
-  return m.reply({
-    embeds: [
-      embed("💬 Frase", quotes[Math.floor(Math.random() * quotes.length)])
-    ]
-  });
-}, "Frase.");
+  await message.reply(quotes[random(0, quotes.length - 1)]);
+});
 
-register("🎮 Diversión", "compliment", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+command(["compliment"], async (message) => {
+  const target = mentionedUser(message) || message.author;
 
-  const compliments = [
-    "¡Tienes una gran energía!",
-    "¡Tu presencia mejora el servidor!",
-    "¡Se nota que tienes creatividad!",
-    "¡Hoy estás haciendo un buen trabajo!"
-  ];
+  await message.reply(
+    `🌸 ${target} tiene una energía increíble.`
+  );
+});
 
-  return m.reply({
-    embeds: [
-      embed("🌟 Cumplido", `${target}: ${compliments[Math.floor(Math.random() * compliments.length)]}`)
-    ]
-  });
-}, "Cumplido.");
+command(["roast"], async (message) => {
+  const target = mentionedUser(message) || message.author;
 
-register("🎮 Diversión", "roast", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+  await message.reply(
+    `🔥 ${target}, Madokami dice que tu Wi-Fi necesita unas vacaciones 😂`
+  );
+});
 
-  const roasts = [
-    "Tu WiFi tiene más personalidad que tú. 😂",
-    "Hasta el bot necesita tiempo para procesar eso. 😂",
-    "Eso fue tan lento que parecía una actualización de Windows."
-  ];
+command(["emoji"], async (message) => {
+  const emojis = ["🌸", "✨", "💫", "🌙", "⭐", "🍀", "🎀"];
 
-  return m.reply({
-    embeds: [
-      embed("🔥 Roast amistoso", `${target}: ${roasts[Math.floor(Math.random() * roasts.length)]}`)
-    ]
-  });
-}, "Roast amistoso.");
+  await message.reply(
+    emojis[random(0, emojis.length - 1)]
+  );
+});
 
-register("🎮 Diversión", "emoji", async (m) => {
-  const emojis = ["🌸", "✨", "🔥", "🌙", "⭐", "💜", "🎮", "😎"];
+command(["color"], async (message) => {
+  const hex = Math.floor(Math.random() * 0xFFFFFF)
+    .toString(16)
+    .padStart(6, "0");
 
-  return m.reply({
-    embeds: [
-      embed("😀 Emoji", emojis[Math.floor(Math.random() * emojis.length)])
-    ]
-  });
-}, "Emoji aleatorio.");
+  await message.reply(`🎨 Color aleatorio: **#${hex.toUpperCase()}**`);
+});
 
-register("🎮 Diversión", "color", async (m) => {
-  const colors = [
-    "Rojo 🔴",
-    "Azul 🔵",
-    "Verde 🟢",
-    "Morado 🟣",
-    "Amarillo 🟡",
-    "Rosa 🩷"
-  ];
+command(["reverse"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🎨 Color",
-        `Tu color es **${colors[Math.floor(Math.random() * colors.length)]}**`
-      )
-    ]
-  });
-}, "Color aleatorio.");
+  if (!text) return message.reply("❌ Escribe un texto.");
 
-register("🎮 Diversión", "number", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🔢 Número",
-        `Tu número aleatorio es **${Math.floor(Math.random() * 100000) + 1}**.`
-      )
-    ]
-  });
-}, "Número aleatorio.");
+  await message.reply(
+    text.split("").reverse().join("")
+  );
+});
 
-register("🎮 Diversión", "reverse", async (m, args) => {
-  if (!args.length) return m.reply("Escribe un texto.");
+command(["scramble"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
 
-  return m.reply({
-    embeds: [
-      embed("🔄 Reverse", args.join(" ").split("").reverse().join(""))
-    ]
-  });
-}, "Invierte un texto.");
+  if (!text) return message.reply("❌ Escribe una palabra.");
 
-register("🎮 Diversión", "scramble", async (m, args) => {
-  if (!args.length) return m.reply("Escribe una palabra.");
-
-  const chars = args.join(" ").split("");
+  const chars = text.split("");
 
   for (let i = chars.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = random(0, i);
     [chars[i], chars[j]] = [chars[j], chars[i]];
   }
 
-  return m.reply({
-    embeds: [
-      embed("🔀 Scramble", chars.join(""))
-    ]
-  });
-}, "Mezcla un texto.");
+  await message.reply(chars.join(""));
+});
+
+command(["riddle"], async (message) => {
+  await message.reply(
+    "🧩 **Adivinanza:** Tengo agujas pero no sé coser. ¿Qué soy?\n\n||Un reloj.||"
+  );
+});
 
 // ============================================================
-// 👥 SOCIAL — 25
+// 💬 SOCIAL
 // ============================================================
 
-register("👥 Social", "profile", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-  const u = userData(m.guild.id, target.id);
+command(["profile"], async (message) => {
+  const user = mentionedUser(message) || message.author;
+  const data = getUser(message.guild.id, user.id);
 
-  return m.reply({
+  await message.reply({
     embeds: [
       embed(
-        `👤 Perfil de ${target.user.username}`,
-        `🪙 Dinero: **${money(u.wallet + u.bank)}**\n` +
-        `⭐ Nivel: **${u.level}**\n` +
-        `💬 Mensajes: **${u.messages}**\n` +
-        `📈 XP: **${u.xp}**`
+        `🌸 Perfil de ${user.username}`,
+        `💰 Dinero: ${formatMoney(data.wallet + data.bank)}\n` +
+        `⭐ Nivel: ${getLevel(data.xp)}\n` +
+        `✨ XP: ${data.xp}\n` +
+        `💬 Mensajes: ${data.messages}\n\n` +
+        `📝 Bio: ${data.bio || "Sin bio."}`
       )
     ]
   });
-}, "Perfil de usuario.");
+});
 
-register("👥 Social", "social", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+command(["social"], async (message) => {
+  const data = getUser(message.guild.id, message.author.id);
 
-  return m.reply({
+  await message.reply(
+    `💬 Tus estadísticas sociales:\n` +
+    `Mensajes: **${data.messages}**\n` +
+    `Comandos: **${data.commands}**`
+  );
+});
+
+command(["say"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
+
+  if (!text) return message.reply("❌ Escribe algo.");
+
+  await message.delete().catch(() => {});
+
+  await message.channel.send({
+    content: text,
+    allowedMentions: { parse: [] }
+  });
+});
+
+command(["whois", "userinfo"], async (message) => {
+  const user = mentionedUser(message) || message.author;
+  const member = await message.guild.members
+    .fetch(user.id)
+    .catch(() => null);
+
+  await message.reply({
     embeds: [
       embed(
-        "👥 Social",
-        `Usuario: ${target}\n` +
-        `Cuenta creada: <t:${Math.floor(target.user.createdTimestamp / 1000)}:R>`
+        `👤 Información de ${user.username}`,
+        `🆔 ID: \`${user.id}\`\n` +
+        `📅 Cuenta: <t:${Math.floor(user.createdTimestamp / 1000)}:F>\n` +
+        `🤖 Bot: ${user.bot ? "Sí" : "No"}\n` +
+        `📅 Entrada al servidor: ${
+          member?.joinedTimestamp
+            ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:F>`
+            : "No disponible"
+        }`
       )
     ]
   });
-}, "Información social.");
+});
 
-register("👥 Social", "ship", async (m, args) => {
-  const target = mentionUser(m, args);
+command(["goodnight"], async (message) => {
+  await message.reply("🌙 ¡Buenas noches! Que descanses.");
+});
+
+command(["goodmorning"], async (message) => {
+  await message.reply("☀️ ¡Buenos días! Que tengas un excelente día.");
+});
+
+command(["highfive"], async (message) => {
+  const target = mentionedUser(message) || message.author;
+
+  await message.reply(`✋ ¡Choca esos cinco con ${target}!`);
+});
+
+command(["wave"], async (message) => {
+  const target = mentionedUser(message) || message.author;
+
+  await message.reply(`👋 ¡${message.author} saluda a ${target}!`);
+});
+
+command(["clap"], async (message) => {
+  await message.reply("👏👏👏 ¡Aplausos!");
+});
+
+command(["smile"], async (message) => {
+  await message.reply("😊 ¡Sonríe!");
+});
+
+command(["goodluck"], async (message) => {
+  const target = mentionedUser(message) || message.author;
+
+  await message.reply(`🍀 ¡Mucha suerte, ${target}!`);
+});
+
+command(["thanks"], async (message) => {
+  await message.reply("🌸 ¡De nada!");
+});
+
+command(["support"], async (message) => {
+  const target = mentionedUser(message) || message.author;
+
+  await message.reply(`💗 ¡Mucho apoyo para ${target}!`);
+});
+
+command(["greet", "welcome"], async (message) => {
+  const target = mentionedUser(message) || message.author;
+
+  await message.reply(`🌸 ¡Bienvenido/a, ${target}!`);
+});
+
+command(["friend"], async (message) => {
+  const target = mentionedUser(message);
 
   if (!target) {
-    return m.reply("Usa `m!ship @usuario`.");
+    return message.reply("❌ Menciona a alguien.");
   }
 
-  const score = Math.floor(Math.random() * 101);
+  await message.reply(
+    `🤝 ${message.author} y ${target} hacen buen equipo.`
+  );
+});
 
-  return m.reply({
+command(["activity", "messages", "socialstats"], async (message) => {
+  const data = getUser(message.guild.id, message.author.id);
+
+  await message.reply({
     embeds: [
       embed(
-        "💞 Compatibilidad",
-        `${m.author} + ${target}\n\n**${score}%**`
+        "📊 Actividad",
+        `💬 Mensajes: **${data.messages}**\n` +
+        `⚙️ Comandos usados: **${data.commands}**\n` +
+        `⭐ Nivel: **${getLevel(data.xp)}**`
       )
     ]
   });
-}, "Compatibilidad amistosa.");
+});
 
-register("👥 Social", "say", async (m, args) => {
-  if (!args.length) return m.reply("Escribe algo.");
+command(["joined"], async (message) => {
+  const member = message.member;
 
-  return m.channel.send({
-    content: args.join(" ")
-  });
-}, "Repite un mensaje.");
+  await message.reply(
+    member.joinedTimestamp
+      ? `📅 Entraste al servidor el <t:${Math.floor(member.joinedTimestamp / 1000)}:F>.`
+      : "❌ No pude obtener tu fecha de entrada."
+  );
+});
 
-register("👥 Social", "whois", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+command(["account"], async (message) => {
+  await message.reply(
+    `📅 Tu cuenta fue creada el <t:${Math.floor(message.author.createdTimestamp / 1000)}:F>.`
+  );
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🔎 WhoIs",
-        `👤 ${target.user.tag}\n` +
-        `🆔 ${target.id}\n` +
-        `📅 Creada: <t:${Math.floor(target.user.createdTimestamp / 1000)}:F>`
-      )
-    ]
-  });
-}, "Busca información de usuario.");
+command(["bio"], async (message) => {
+  const user = mentionedUser(message) || message.author;
+  const data = getUser(message.guild.id, user.id);
 
-register("👥 Social", "goodnight", async (m) => {
-  return m.reply({
-    embeds: [
-      embed("🌙 Buenas noches", `¡Buenas noches, ${m.author}! 🌙`)
-    ]
-  });
-}, "Buenas noches.");
+  await message.reply(
+    `📝 Bio de **${user.username}**:\n${data.bio || "Sin bio."}`
+  );
+});
 
-register("👥 Social", "goodmorning", async (m) => {
-  return m.reply({
-    embeds: [
-      embed("☀️ Buenos días", `¡Buenos días, ${m.author}! ☀️`)
-    ]
-  });
-}, "Buenos días.");
+command(["setbio"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
 
-register("👥 Social", "love", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("💜 Love", `${m.author} manda cariño a ${target}.`)
-    ]
-  });
-}, "Envía cariño.");
-
-register("👥 Social", "highfive", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("✋ High Five", `${m.author} chocó los cinco con ${target}.`)
-    ]
-  });
-}, "Choca los cinco.");
-
-register("👥 Social", "wave", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("👋 Saludo", `${m.author} saluda a ${target}.`)
-    ]
-  });
-}, "Saluda.");
-
-register("👥 Social", "clap", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("👏 Aplausos", `${m.author} aplaude a ${target}.`)
-    ]
-  });
-}, "Aplaude.");
-
-register("👥 Social", "smile", async (m) => {
-  return m.reply({
-    embeds: [
-      embed("😊 Sonrisa", `${m.author} está sonriendo. 😊`)
-    ]
-  });
-}, "Sonríe.");
-
-register("👥 Social", "goodluck", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("🍀 Buena suerte", `¡Buena suerte, ${target}! 🍀`)
-    ]
-  });
-}, "Desea buena suerte.");
-
-register("👥 Social", "thanks", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("🙏 Gracias", `${m.author} le da las gracias a ${target}.`)
-    ]
-  });
-}, "Da las gracias.");
-
-register("👥 Social", "support", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("💜 Apoyo", `${m.author} apoya a ${target}.`)
-    ]
-  });
-}, "Muestra apoyo.");
-
-register("👥 Social", "greet", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("🌸 Saludo", `¡Hola ${target}!`)
-    ]
-  });
-}, "Saluda a alguien.");
-
-register("👥 Social", "friend", async (m, args) => {
-  const target = mentionUser(m, args);
-
-  if (!target) return m.reply("Menciona a alguien.");
-
-  return m.reply({
-    embeds: [
-      embed("🤝 Amistad", `${m.author} considera a ${target} un buen amigo/a.`)
-    ]
-  });
-}, "Mensaje de amistad.");
-
-register("👥 Social", "welcome", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed("🌸 Bienvenido", `¡Bienvenido/a ${target}!`)
-    ]
-  });
-}, "Da la bienvenida.");
-
-register("👥 Social", "activity", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
-    embeds: [
-      embed(
-        "🎮 Actividad",
-        `${target} está en **${target.presence?.status || "offline"}**.`
-      )
-    ]
-  });
-}, "Muestra actividad.");
-
-register("👥 Social", "messages", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-  const u = userData(m.guild.id, target.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "💬 Mensajes",
-        `${target} tiene **${u.messages} mensajes registrados**.`
-      )
-    ]
-  });
-}, "Mensajes de usuario.");
-
-register("👥 Social", "socialstats", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "📊 Estadísticas sociales",
-        `💬 Mensajes: **${u.messages}**\n` +
-        `⭐ Nivel: **${u.level}**\n` +
-        `📈 XP: **${u.xp}**\n` +
-        `💰 Dinero: **${money(u.wallet + u.bank)}**`
-      )
-    ]
-  });
-}, "Tus estadísticas sociales.");
-
-register("👥 Social", "joined", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  if (!target.joinedTimestamp) {
-    return m.reply("No pude obtener esa fecha.");
+  if (!text) {
+    return message.reply("❌ Uso: `m!setbio tu texto`");
   }
 
-  return m.reply({
-    embeds: [
-      embed(
-        "📅 Entrada al servidor",
-        `${target} entró <t:${Math.floor(target.joinedTimestamp / 1000)}:F>`
-      )
-    ]
-  });
-}, "Muestra cuándo entró.");
+  if (text.length > 250) {
+    return message.reply("❌ La bio puede tener máximo 250 caracteres.");
+  }
 
-register("👥 Social", "account", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+  const user = getUser(message.guild.id, message.author.id);
 
-  return m.reply({
-    embeds: [
-      embed(
-        "👤 Cuenta",
-        `Usuario: **${target.user.tag}**\n` +
-        `ID: **${target.id}**\n` +
-        `Creada: <t:${Math.floor(target.user.createdTimestamp / 1000)}:F>`
-      )
-    ]
-  });
-}, "Información de cuenta.");
+  user.bio = text;
+  scheduleSave();
 
-register("👥 Social", "status", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+  await message.reply("🌸 Tu bio fue actualizada.");
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🟢 Estado",
-        `${target}: **${target.presence?.status || "offline"}**`
-      )
-    ]
-  });
-}, "Estado de usuario.");
+command(["clearbio"], async (message) => {
+  const user = getUser(message.guild.id, message.author.id);
 
-register("👥 Social", "avatar", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+  user.bio = "";
+  scheduleSave();
 
-  return m.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(COLOR)
-        .setTitle(`🖼️ Avatar de ${target.user.username}`)
-        .setImage(target.user.displayAvatarURL({ size: 1024 }))
-    ]
-  });
-}, "Avatar.");
-
-register("👥 Social", "roles", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  const roles = target.roles.cache
-    .filter(r => r.id !== m.guild.id)
-    .map(r => r.toString())
-    .join(", ") || "Sin roles.";
-
-  return m.reply({
-    embeds: [
-      embed("🎭 Roles", roles)
-    ]
-  });
-}, "Roles de usuario.");
+  await message.reply("🧹 Tu bio fue eliminada.");
+});
 
 // ============================================================
-// ⭐ NIVELES — 25
+// ⭐ NIVELES
 // ============================================================
 
-function levelText(u) {
-  return `Nivel **${u.level}** — XP **${u.xp}/${u.level * 100}**`;
-}
+command([
+  "level",
+  "xp",
+  "levels",
+  "myrank",
+  "levelinfo",
+  "progress",
+  "xprequired",
+  "xpneeded",
+  "levelstats",
+  "levelcheck",
+  "mylevel",
+  "myxp",
+  "progressbar",
+  "levelcard",
+  "xpstats",
+  "rankinfo",
+  "levelboard",
+  "messagesxp",
+  "xppermessage",
+  "levelgoal"
+], async (message) => {
+  const user = mentionedUser(message) || message.author;
+  const data = getUser(message.guild.id, user.id);
 
-register("⭐ Niveles", "level", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
+  const level = getLevel(data.xp);
+  const current = data.xp - xpForLevel(level);
+  const required = xpForNextLevel(level) - xpForLevel(level);
 
-  return m.reply({
-    embeds: [embed("⭐ Nivel", levelText(u))]
-  });
-}, "Muestra tu nivel.");
-
-register("⭐ Niveles", "xp", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
+  await message.reply({
     embeds: [
       embed(
-        "✨ XP",
-        `Tienes **${u.xp} XP**.\nNecesitas **${u.level * 100 - u.xp} XP** para subir.`
+        `⭐ Nivel de ${user.username}`,
+        `**Nivel:** ${level}\n` +
+        `**XP total:** ${data.xp}\n` +
+        `**Progreso:** ${current}/${required}\n\n` +
+        `${progressBar(current, required)}`
       )
     ]
   });
-}, "Muestra tu XP.");
+});
 
-register("⭐ Niveles", "rank", async (m) => {
-  const g = guildData(m.guild.id);
+command(["rank", "xprank", "topxp", "toplevels"], async (message) => {
+  const guild = getGuild(message.guild.id);
 
-  const users = Object.entries(g.users)
-    .sort((a, b) =>
-      (b[1].level * 1000 + b[1].xp) -
-      (a[1].level * 1000 + a[1].xp)
-    );
-
-  const pos = users.findIndex(x => x[0] === m.author.id) + 1;
-
-  return m.reply({
-    embeds: [
-      embed(
-        "🏆 Rank",
-        `Tu posición es **#${pos || "?"}**.`
-      )
-    ]
-  });
-}, "Muestra tu posición.");
-
-register("⭐ Niveles", "levels", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "📈 Niveles",
-        `Nivel actual: **${u.level}**\nXP: **${u.xp}**`
-      )
-    ]
-  });
-}, "Información de niveles.");
-
-register("⭐ Niveles", "nextlevel", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "⬆️ Siguiente nivel",
-        `Te faltan **${u.level * 100 - u.xp} XP**.`
-      )
-    ]
-  });
-}, "XP restante.");
-
-register("⭐ Niveles", "myrank", async (m) => {
-  return commands.get("rank").handler(m, []);
-}, "Tu ranking.");
-
-register("⭐ Niveles", "topxp", async (m) => {
-  const users = Object.entries(guildData(m.guild.id).users)
-    .sort((a, b) => b[1].xp - a[1].xp)
+  const ranking = Object.entries(guild.users)
+    .map(([id, user]) => ({
+      id,
+      xp: user.xp || 0
+    }))
+    .sort((a, b) => b.xp - a.xp)
     .slice(0, 10);
 
-  const text = users.map((x, i) =>
-    `**${i + 1}.** <@${x[0]}> — ${x[1].xp} XP`
-  ).join("\n") || "No hay datos.";
+  if (!ranking.length) {
+    return message.reply("⭐ Todavía no hay ranking.");
+  }
 
-  return m.reply({
-    embeds: [embed("🏆 Top XP", text)]
-  });
-}, "Top de XP.");
-
-register("⭐ Niveles", "levelinfo", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
+  await message.reply({
     embeds: [
       embed(
-        "⭐ Información de nivel",
-        `Nivel: **${u.level}**\nXP: **${u.xp}**\nMeta: **${u.level * 100} XP**`
+        "🏆 Ranking de XP",
+        ranking
+          .map(
+            (x, i) =>
+              `**${i + 1}.** <@${x.id}> — Nivel ${getLevel(x.xp)} (${x.xp} XP)`
+          )
+          .join("\n")
       )
     ]
   });
-}, "Información de nivel.");
-
-register("⭐ Niveles", "progress", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-  const total = u.level * 100;
-  const percent = Math.floor((u.xp / total) * 100);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "📊 Progreso",
-        `[${"█".repeat(Math.floor(percent / 10))}${"░".repeat(10 - Math.floor(percent / 10))}] ${percent}%`
-      )
-    ]
-  });
-}, "Progreso del nivel.");
-
-register("⭐ Niveles", "xprequired", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "✨ XP requerida",
-        `Necesitas **${u.level * 100} XP** para completar el nivel.`
-      )
-    ]
-  });
-}, "XP requerida.");
-
-register("⭐ Niveles", "xpneeded", async (m) => {
-  return commands.get("nextlevel").handler(m, []);
-}, "XP restante.");
-
-register("⭐ Niveles", "levelstats", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "📊 Estadísticas de nivel",
-        `Nivel: **${u.level}**\nXP: **${u.xp}**\nMensajes: **${u.messages}**`
-      )
-    ]
-  });
-}, "Estadísticas.");
-
-register("⭐ Niveles", "levelcheck", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-  const u = userData(m.guild.id, target.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "🔎 Nivel",
-        `${target} está en el nivel **${u.level}** con **${u.xp} XP**.`
-      )
-    ]
-  });
-}, "Comprueba el nivel.");
-
-register("⭐ Niveles", "mylevel", async (m) => {
-  return commands.get("level").handler(m, []);
-}, "Tu nivel.");
-
-register("⭐ Niveles", "myxp", async (m) => {
-  return commands.get("xp").handler(m, []);
-}, "Tu XP.");
-
-register("⭐ Niveles", "xprank", async (m) => {
-  return commands.get("topxp").handler(m, []);
-}, "Ranking XP.");
-
-register("⭐ Niveles", "toplevels", async (m) => {
-  const users = Object.entries(guildData(m.guild.id).users)
-    .sort((a, b) => b[1].level - a[1].level)
-    .slice(0, 10);
-
-  const text = users.map((x, i) =>
-    `**${i + 1}.** <@${x[0]}> — Nivel ${x[1].level}`
-  ).join("\n") || "No hay datos.";
-
-  return m.reply({
-    embeds: [embed("🏆 Top niveles", text)]
-  });
-}, "Top niveles.");
-
-register("⭐ Niveles", "progressbar", async (m) => {
-  return commands.get("progress").handler(m, []);
-}, "Barra de progreso.");
-
-register("⭐ Niveles", "levelcard", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        `⭐ ${m.author.username}`,
-        `Nivel **${u.level}**\nXP **${u.xp}/${u.level * 100}**`
-      )
-    ]
-  });
-}, "Tarjeta de nivel.");
-
-register("⭐ Niveles", "xpstats", async (m) => {
-  return commands.get("levelstats").handler(m, []);
-}, "Estadísticas XP.");
-
-register("⭐ Niveles", "rankinfo", async (m) => {
-  return commands.get("rank").handler(m, []);
-}, "Información de ranking.");
-
-register("⭐ Niveles", "levelboard", async (m) => {
-  return commands.get("toplevels").handler(m, []);
-}, "Tabla de niveles.");
-
-register("⭐ Niveles", "messagesxp", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "💬 XP por mensajes",
-        `Mensajes registrados: **${u.messages}**\n` +
-        `XP actual: **${u.xp}**`
-      )
-    ]
-  });
-}, "Mensajes y XP.");
-
-register("⭐ Niveles", "xppermessage", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "✨ XP por mensaje",
-        "Madokami otorga **5 XP** por cada mensaje registrado."
-      )
-    ]
-  });
-}, "XP por mensaje.");
-
-register("⭐ Niveles", "levelgoal", async (m) => {
-  const u = userData(m.guild.id, m.author.id);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "🎯 Objetivo",
-        `Tu objetivo es alcanzar el nivel **${u.level + 1}**.`
-      )
-    ]
-  });
-}, "Objetivo de nivel.");
+});
 
 // ============================================================
-// 📚 INFORMACIÓN — 25
+// ℹ️ INFORMACIÓN
 // ============================================================
 
-register("📚 Información", "userinfo", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+command(["serverinfo", "server", "guild", "information"], async (message) => {
+  const guild = message.guild;
 
-  return m.reply({
+  await message.reply({
     embeds: [
       embed(
-        "👤 Información",
-        `Usuario: **${target.user.tag}**\n` +
-        `ID: **${target.id}**\n` +
-        `Creada: <t:${Math.floor(target.user.createdTimestamp / 1000)}:F>\n` +
-        `Entrada: ${target.joinedTimestamp ? `<t:${Math.floor(target.joinedTimestamp / 1000)}:F>` : "Desconocida"}`
+        `🏠 ${guild.name}`,
+        `🆔 ID: \`${guild.id}\`\n` +
+        `👥 Miembros: **${guild.memberCount}**\n` +
+        `💬 Canales: **${guild.channels.cache.size}**\n` +
+        `🎭 Roles: **${guild.roles.cache.size}**\n` +
+        `👑 Dueño: <@${guild.ownerId}>\n` +
+        `📅 Creado: <t:${Math.floor(guild.createdTimestamp / 1000)}:F>`
       )
     ]
   });
-}, "Información de usuario.");
+});
 
-register("📚 Información", "serverinfo", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🏠 Servidor",
-        `Nombre: **${m.guild.name}**\n` +
-        `ID: **${m.guild.id}**\n` +
-        `Miembros: **${m.guild.memberCount}**\n` +
-        `Canales: **${m.guild.channels.cache.size}**\n` +
-        `Roles: **${m.guild.roles.cache.size - 1}**`
-      )
-    ]
-  });
-}, "Información del servidor.");
+command(["avatar"], async (message) => {
+  const user = mentionedUser(message) || message.author;
 
-register("📚 Información", "avatar", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  return m.reply({
+  await message.reply({
     embeds: [
       new EmbedBuilder()
-        .setColor(COLOR)
-        .setTitle(`🖼️ Avatar de ${target.user.username}`)
-        .setImage(target.user.displayAvatarURL({ size: 1024 }))
+        .setColor(0xE8A7FF)
+        .setTitle(`🖼️ Avatar de ${user.username}`)
+        .setImage(user.displayAvatarURL({ size: 1024 }))
     ]
   });
-}, "Avatar.");
+});
 
-register("📚 Información", "id", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
+command(["id", "serverid"], async (message) => {
+  await message.reply(`🆔 ID del servidor: \`${message.guild.id}\``);
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🆔 ID",
-        `${target}: **${target.id}**`
-      )
-    ]
-  });
-}, "ID.");
+command(["roles", "rolescount", "rolecount"], async (message) => {
+  await message.reply(
+    `🎭 Este servidor tiene **${message.guild.roles.cache.size} roles**.`
+  );
+});
 
-register("📚 Información", "roles", async (m) => {
-  const roles = m.guild.roles.cache
-    .filter(r => r.id !== m.guild.id)
-    .sort((a, b) => b.position - a.position)
-    .map(r => r.toString())
-    .slice(0, 50);
+command(["channels", "channelcount"], async (message) => {
+  await message.reply(
+    `📚 Este servidor tiene **${message.guild.channels.cache.size} canales**.`
+  );
+});
 
-  return m.reply({
-    embeds: [
-      embed("🎭 Roles", roles.join(", ") || "No hay roles.")
-    ]
-  });
-}, "Roles.");
+command(["members", "membercount"], async (message) => {
+  await message.reply(
+    `👥 Miembros del servidor: **${message.guild.memberCount}**.`
+  );
+});
 
-register("📚 Información", "channels", async (m) => {
-  const channels = m.guild.channels.cache
-    .map(c => `${c.type === ChannelType.GuildText ? "💬" : "🔊"} ${c.name}`)
-    .slice(0, 50);
+command(["icon", "servericon"], async (message) => {
+  const icon = message.guild.iconURL({ size: 1024 });
 
-  return m.reply({
-    embeds: [
-      embed("📚 Canales", channels.join("\n") || "No hay canales.")
-    ]
-  });
-}, "Canales.");
+  if (!icon) {
+    return message.reply("❌ Este servidor no tiene icono.");
+  }
 
-register("📚 Información", "members", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "👥 Miembros",
-        `Este servidor tiene **${m.guild.memberCount} miembros**.`
-      )
-    ]
-  });
-}, "Miembros.");
-
-register("📚 Información", "icon", async (m) => {
-  return m.reply({
+  await message.reply({
     embeds: [
       new EmbedBuilder()
-        .setColor(COLOR)
-        .setTitle(`🖼️ Icono de ${m.guild.name}`)
-        .setImage(m.guild.iconURL({ size: 1024 }) || null)
+        .setColor(0xE8A7FF)
+        .setTitle(`🖼️ Icono de ${message.guild.name}`)
+        .setImage(icon)
     ]
   });
-}, "Icono.");
+});
 
-register("📚 Información", "created", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "📅 Creación",
-        `Servidor creado <t:${Math.floor(m.guild.createdTimestamp / 1000)}:F>`
-      )
-    ]
-  });
-}, "Fecha de creación.");
+command(["created"], async (message) => {
+  await message.reply(
+    `📅 El servidor fue creado el <t:${Math.floor(message.guild.createdTimestamp / 1000)}:F>.`
+  );
+});
 
-register("📚 Información", "owner", async (m) => {
-  const owner = await m.guild.fetchOwner();
+command(["owner", "serverowner"], async (message) => {
+  await message.reply(`👑 Dueño: <@${message.guild.ownerId}>`);
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "👑 Dueño",
-        `${owner.user.tag}\nID: ${owner.id}`
-      )
-    ]
-  });
-}, "Dueño.");
+command(["boost"], async (message) => {
+  await message.reply(
+    `🚀 Nivel de boost: **${message.guild.premiumTier}**\n` +
+    `💎 Boosts: **${message.guild.premiumSubscriptionCount || 0}**`
+  );
+});
 
-register("📚 Información", "boost", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🚀 Boost",
-        `Nivel: **${m.guild.premiumTier}**\nBoosts: **${m.guild.premiumSubscriptionCount || 0}**`
-      )
-    ]
-  });
-}, "Boosts.");
-
-register("📚 Información", "rolescount", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🎭 Roles",
-        `Cantidad: **${m.guild.roles.cache.size - 1}**`
-      )
-    ]
-  });
-}, "Cantidad de roles.");
-
-register("📚 Información", "channelcount", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "📚 Canales",
-        `Cantidad: **${m.guild.channels.cache.size}**`
-      )
-    ]
-  });
-}, "Cantidad de canales.");
-
-register("📚 Información", "botinfo", async (m) => {
-  return m.reply({
+command(["botinfo", "botstats"], async (message) => {
+  await message.reply({
     embeds: [
       embed(
         "🌸 Madokami",
-        `Discord.js: **v14**\n` +
-        `Node.js: **${process.version}**\n` +
-        `Servidores: **${client.guilds.cache.size}**`
+        `🤖 Nombre: **${client.user.username}**\n` +
+        `🆔 ID: \`${client.user.id}\`\n` +
+        `📚 Servidores: **${client.guilds.cache.size}**\n` +
+        `⚙️ Comandos: **${commands.size}**`
       )
     ]
   });
-}, "Información del bot.");
+});
 
-register("📚 Información", "membercount", async (m) => {
-  return m.reply({
-    embeds: [
-      embed("👥 Miembros", `${m.guild.memberCount}`)
-    ]
-  });
-}, "Cantidad de miembros.");
+command(["channelinfo"], async (message) => {
+  const channel =
+    message.mentions.channels.first() || message.channel;
 
-register("📚 Información", "rolecount", async (m) => {
-  return m.reply({
-    embeds: [
-      embed("🎭 Roles", `${m.guild.roles.cache.size - 1}`)
-    ]
-  });
-}, "Cantidad de roles.");
+  await message.reply(
+    `📚 **${channel.name}**\n` +
+    `🆔 \`${channel.id}\`\n` +
+    `📁 Tipo: **${channel.type}**`
+  );
+});
 
-register("📚 Información", "channelinfo", async (m, args) => {
-  const channel = m.mentions.channels.first() ||
-    m.guild.channels.cache.get(args[0]) ||
-    m.channel;
+command(["memberinfo"], async (message) => {
+  const member =
+    mentionedMember(message) || message.member;
 
-  return m.reply({
-    embeds: [
-      embed(
-        "📚 Canal",
-        `Nombre: **${channel.name}**\nID: **${channel.id}**\nTipo: **${channel.type}**`
-      )
-    ]
-  });
-}, "Información de canal.");
+  await message.reply(
+    `👤 **${member.user.username}**\n` +
+    `🆔 \`${member.id}\`\n` +
+    `🎭 Roles: **${Math.max(member.roles.cache.size - 1, 0)}**`
+  );
+});
 
-register("📚 Información", "serverid", async (m) => {
-  return m.reply({
-    embeds: [embed("🆔 Server ID", m.guild.id)]
-  });
-}, "ID del servidor.");
+command(["permissions"], async (message) => {
+  const permissions = message.member.permissions.toArray();
 
-register("📚 Información", "servericon", async (m) => {
-  return commands.get("icon").handler(m, []);
-}, "Icono.");
-
-register("📚 Información", "serverowner", async (m) => {
-  return commands.get("owner").handler(m, []);
-}, "Dueño.");
-
-register("📚 Información", "memberinfo", async (m, args) => {
-  return commands.get("userinfo").handler(m, args);
-}, "Información.");
-
-register("📚 Información", "botstats", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "📊 Estadísticas",
-        `Servidores: **${client.guilds.cache.size}**\n` +
-        `Usuarios aproximados: **${client.guilds.cache.reduce((a, g) => a + g.memberCount, 0)}**`
-      )
-    ]
-  });
-}, "Estadísticas.");
-
-register("📚 Información", "guild", async (m) => {
-  return commands.get("serverinfo").handler(m, []);
-}, "Información del servidor.");
-
-register("📚 Información", "information", async (m) => {
-  return commands.get("serverinfo").handler(m, []);
-}, "Información.");
-
-register("📚 Información", "permissions", async (m, args) => {
-  const target = mentionUser(m, args) || m.member;
-
-  const perms = target.permissions.toArray();
-
-  return m.reply({
-    embeds: [
-      embed(
-        "🔐 Permisos",
-        perms.map(p => `• ${p}`).join("\n") || "Sin permisos."
-      )
-    ]
-  });
-}, "Permisos.");
+  await sendLong(
+    message,
+    `🔐 Tus permisos:\n${permissions.map(p => `• ${p}`).join("\n")}`
+  );
+});
 
 // ============================================================
-// 🛠️ UTILIDADES — 25
+// 🛠️ UTILIDADES
 // ============================================================
 
-register("🛠️ Utilidades", "ping", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🏓 Pong",
-        `Latencia: **${client.ws.ping}ms**`
-      )
-    ]
-  });
-}, "Latencia.");
+command(["ping"], async (message) => {
+  await message.reply(`🏓 Pong! **${client.ws.ping}ms**`);
+});
 
-register("🛠️ Utilidades", "poll", async (m, args) => {
-  if (!args.length) {
-    return m.reply("Usa `m!poll ¿pregunta?`.");
+command(["poll"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
+
+  if (!text) {
+    return message.reply("❌ Uso: `m!poll pregunta`");
   }
 
-  const msg = await m.channel.send({
+  const msg = await message.channel.send({
     embeds: [
-      embed("📊 Encuesta", args.join(" "))
+      embed("📊 Encuesta", text)
     ]
   });
 
-  await msg.react("👍");
-  await msg.react("👎");
+  await msg.react("👍").catch(() => {});
+  await msg.react("👎").catch(() => {});
+});
 
-  return;
-}, "Crea una encuesta.");
+command(["remind"], async (message) => {
+  const duration = parseDuration(message.args?.[1]);
+  const text = message.args?.slice(2).join(" ");
 
-register("🛠️ Utilidades", "remind", async (m, args) => {
-  const seconds = Number(args[0]);
-
-  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 86400) {
-    return m.reply("Usa `m!remind segundos mensaje`.");
+  if (!duration || !text) {
+    return message.reply(
+      "❌ Uso: `m!remind 10m estudiar`"
+    );
   }
 
-  const text = args.slice(1).join(" ") || "Recordatorio";
+  if (duration > 24 * 60 * 60 * 1000) {
+    return message.reply("❌ El máximo es 24 horas.");
+  }
 
-  await m.reply({
-    embeds: [
-      successEmbed(`⏰ Te recordaré esto en **${seconds} segundos**.`)
-    ]
-  });
+  await message.reply("⏰ Recordatorio creado.");
 
   setTimeout(() => {
-    m.author.send(`⏰ **Recordatorio:** ${text}`).catch(() => {});
-  }, seconds * 1000);
-}, "Crea un recordatorio.");
+    message.author.send(`⏰ Recordatorio: ${text}`)
+      .catch(() => {
+        message.channel.send(
+          `${message.author} ⏰ Recordatorio: ${text}`
+        );
+      });
+  }, duration);
+});
 
-register("🛠️ Utilidades", "time", async (m) => {
-  return m.reply({
+command(["time"], async (message) => {
+  await message.reply(
+    `🕐 Ahora mismo son **${new Date().toLocaleString("es-ES")}**.`
+  );
+});
+
+command(["timestamp"], async (message) => {
+  await message.reply(
+    `<t:${Math.floor(Date.now() / 1000)}:F>`
+  );
+});
+
+command(["invite"], async (message) => {
+  const url = await client.generateInvite({
+    scopes: ["bot", "applications.commands"],
+    permissions: []
+  });
+
+  await message.reply(url);
+});
+
+command(["sayembed"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
+
+  if (!text) return message.reply("❌ Escribe un texto.");
+
+  await message.channel.send({
     embeds: [
-      embed(
-        "🕐 Hora",
-        `<t:${Math.floor(Date.now() / 1000)}:F>`
-      )
+      embed("🌸 Madokami", text)
     ]
   });
-}, "Hora actual.");
+});
 
-register("🛠️ Utilidades", "timestamp", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "⏱️ Timestamp",
-        `<t:${Math.floor(Date.now() / 1000)}:F>\n<t:${Math.floor(Date.now() / 1000)}:R>`
-      )
-    ]
-  });
-}, "Timestamp.");
+command(["uptime"], async (message) => {
+  const seconds = Math.floor(process.uptime());
 
-register("🛠️ Utilidades", "invite", async (m) => {
-  const url =
-    `https://discord.com/oauth2/authorize?client_id=${client.user.id}` +
-    `&scope=bot%20applications.commands&permissions=8`;
+  await message.reply(
+    `⏱️ Uptime: **${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ${seconds % 60}s**`
+  );
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🌸 Invitar Madokami",
-        `[Haz clic aquí para invitar a Madokami](${url})`
-      )
-    ]
-  });
-}, "Invitación.");
-
-register("🛠️ Utilidades", "sayembed", async (m, args) => {
-  if (!args.length) return m.reply("Escribe un mensaje.");
-
-  return m.channel.send({
-    embeds: [
-      embed("🌸 Madokami", args.join(" "))
-    ]
-  });
-}, "Envía un embed.");
-
-register("🛠️ Utilidades", "uptime", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "⏱️ Uptime",
-        formatDuration(client.uptime)
-      )
-    ]
-  });
-}, "Tiempo activo.");
-
-register("🛠️ Utilidades", "support", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "💜 Soporte",
-        "Si tienes problemas con Madokami, revisa primero la configuración de permisos e intents del bot."
-      )
-    ]
-  });
-}, "Soporte.");
-
-register("🛠️ Utilidades", "calc", async (m, args) => {
-  const expression = args.join(" ");
+command(["calc", "math"], async (message) => {
+  const expression = message.args?.slice(1).join(" ");
 
   if (!expression) {
-    return m.reply("Usa `m!calc 2 + 2`.");
+    return message.reply("❌ Uso: `m!calc 25*4+10`");
   }
 
   if (!/^[0-9+\-*/().%\s]+$/.test(expression)) {
-    return m.reply({
-      embeds: [errorEmbed("Solo se permiten operaciones matemáticas básicas.")]
-    });
+    return message.reply("❌ Solo se permiten operaciones matemáticas básicas.");
   }
 
   try {
     const result = Function(`"use strict"; return (${expression})`)();
 
-    return m.reply({
-      embeds: [
-        embed(
-          "🧮 Calculadora",
-          `\`${expression}\` = **${result}**`
-        )
-      ]
-    });
+    if (!Number.isFinite(result)) {
+      return message.reply("❌ Resultado inválido.");
+    }
+
+    await message.reply(`🧮 Resultado: **${result}**`);
   } catch {
-    return m.reply({
-      embeds: [errorEmbed("No pude calcular esa expresión.")]
-    });
+    await message.reply("❌ No pude calcular esa operación.");
   }
-}, "Calculadora.");
+});
 
-register("🛠️ Utilidades", "charcount", async (m, args) => {
-  const text = args.join(" ");
+command(["charcount", "length"], async (message) => {
+  const text = message.args?.slice(1).join(" ") || "";
 
-  return m.reply({
-    embeds: [
-      embed("🔢 Caracteres", `Cantidad: **${text.length}**`)
-    ]
-  });
-}, "Cuenta caracteres.");
+  await message.reply(`🔢 Caracteres: **${text.length}**`);
+});
 
-register("🛠️ Utilidades", "wordcount", async (m, args) => {
-  const text = args.join(" ").trim();
-  const count = text ? text.split(/\s+/).length : 0;
+command(["wordcount"], async (message) => {
+  const text = message.args?.slice(1).join(" ").trim();
 
-  return m.reply({
-    embeds: [
-      embed("📝 Palabras", `Cantidad: **${count}**`)
-    ]
-  });
-}, "Cuenta palabras.");
+  if (!text) return message.reply("🔢 Palabras: **0**");
 
-register("🛠️ Utilidades", "reverse", async (m, args) => {
-  return m.reply(args.join(" ").split("").reverse().join(""));
-}, "Invierte texto.");
+  await message.reply(
+    `🔢 Palabras: **${text.split(/\s+/).length}**`
+  );
+});
 
-register("🛠️ Utilidades", "uppercase", async (m, args) => {
-  return m.reply(args.join(" ").toUpperCase());
-}, "Mayúsculas.");
+command(["uppercase"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
 
-register("🛠️ Utilidades", "lowercase", async (m, args) => {
-  return m.reply(args.join(" ").toLowerCase());
-}, "Minúsculas.");
+  if (!text) return message.reply("❌ Escribe un texto.");
 
-register("🛠️ Utilidades", "repeat", async (m, args) => {
-  const count = Math.min(Number(args[0]) || 1, 10);
-  const text = args.slice(1).join(" ");
+  await message.reply(text.toUpperCase());
+});
 
-  if (!text) return m.reply("Escribe un texto.");
+command(["lowercase"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
 
-  return m.reply({
-    content: Array(count).fill(text).join("\n"),
-    allowedMentions: { parse: [] }
-  });
-}, "Repite texto.");
+  if (!text) return message.reply("❌ Escribe un texto.");
 
-register("🛠️ Utilidades", "firstword", async (m, args) => {
-  return m.reply(args[0] || "No escribiste ninguna palabra.");
-}, "Primera palabra.");
+  await message.reply(text.toLowerCase());
+});
 
-register("🛠️ Utilidades", "lastword", async (m, args) => {
-  return m.reply(args[args.length - 1] || "No escribiste ninguna palabra.");
-}, "Última palabra.");
+command(["repeat"], async (message) => {
+  const amount = Math.min(
+    Math.max(Number(message.args?.[1]) || 1, 1),
+    5
+  );
 
-register("🛠️ Utilidades", "length", async (m, args) => {
-  return m.reply(`Longitud: **${args.join(" ").length}** caracteres.`);
-}, "Longitud de texto.");
+  const text = message.args?.slice(2).join(" ");
 
-register("🛠️ Utilidades", "serverstats", async (m) => {
-  return commands.get("serverinfo").handler(m, []);
-}, "Estadísticas del servidor.");
+  if (!text) return message.reply("❌ Escribe un texto.");
 
-register("🛠️ Utilidades", "botstats", async (m) => {
-  return commands.get("botinfo").handler(m, []);
-}, "Estadísticas del bot.");
+  await message.reply(
+    Array(amount).fill(text).join("\n")
+  );
+});
 
-register("🛠️ Utilidades", "roleinfo", async (m, args) => {
-  const role =
-    m.mentions.roles.first() ||
-    m.guild.roles.cache.get(args[0]);
+command(["firstword"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
 
-  if (!role) return m.reply("Menciona un rol.");
+  if (!text) return message.reply("❌ Escribe un texto.");
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🎭 Rol",
-        `Nombre: **${role.name}**\n` +
-        `ID: **${role.id}**\n` +
-        `Miembros: **${role.members.size}**\n` +
-        `Posición: **${role.position}**`
-      )
-    ]
-  });
-}, "Información de rol.");
+  await message.reply(`🔤 Primera palabra: **${text.split(/\s+/)[0]}**`);
+});
 
-register("🛠️ Utilidades", "channelinfo", async (m, args) => {
-  return commands.get("channelinfo").handler(m, args);
-}, "Información de canal.");
+command(["lastword"], async (message) => {
+  const text = message.args?.slice(1).join(" ");
 
-register("🛠️ Utilidades", "permissions", async (m, args) => {
-  return commands.get("permissions").handler(m, args);
-}, "Permisos.");
+  if (!text) return message.reply("❌ Escribe un texto.");
 
-register("🛠️ Utilidades", "snowflake", async (m, args) => {
-  const id = args[0];
+  const words = text.split(/\s+/);
 
-  if (!id || !/^\d{17,20}$/.test(id)) {
-    return m.reply("Escribe una ID de Discord válida.");
+  await message.reply(`🔤 Última palabra: **${words[words.length - 1]}**`);
+});
+
+command(["serverstats"], async (message) => {
+  await message.reply(
+    `📊 **Estadísticas**\n` +
+    `👥 Miembros: ${message.guild.memberCount}\n` +
+    `📚 Canales: ${message.guild.channels.cache.size}\n` +
+    `🎭 Roles: ${message.guild.roles.cache.size}`
+  );
+});
+
+command(["roleinfo"], async (message) => {
+  const role = message.mentions.roles.first();
+
+  if (!role) return message.reply("❌ Menciona un rol.");
+
+  await message.reply(
+    `🎭 **${role.name}**\n` +
+    `🆔 \`${role.id}\`\n` +
+    `👥 Miembros: **${role.members.size}**\n` +
+    `📅 Creado: <t:${Math.floor(role.createdTimestamp / 1000)}:F>`
+  );
+});
+
+command(["snowflake"], async (message) => {
+  const id = message.args?.[1];
+
+  if (!id || !/^\d+$/.test(id)) {
+    return message.reply("❌ Introduce un ID de Discord válido.");
   }
 
-  const timestamp = Number((BigInt(id) >> 22n) + 1420070400000n);
+  try {
+    const timestamp =
+      Number((BigInt(id) >> 22n)) + 1420070400000;
 
-  return m.reply({
-    embeds: [
-      embed(
-        "❄️ Snowflake",
-        `Creado aproximadamente: <t:${Math.floor(timestamp / 1000)}:F>`
-      )
-    ]
-  });
-}, "Información de Snowflake.");
+    await message.reply(
+      `🆔 ID: \`${id}\`\n📅 Fecha aproximada: <t:${Math.floor(timestamp / 1000)}:F>`
+    );
+  } catch {
+    await message.reply("❌ ID inválido.");
+  }
+});
+
+command(["textinfo", "utility"], async (message) => {
+  const text = message.args?.slice(1).join(" ") || "";
+
+  await message.reply(
+    `📝 Caracteres: **${text.length}**\n` +
+    `🔤 Palabras: **${text ? text.split(/\s+/).length : 0}**`
+  );
+});
 
 // ============================================================
-// 🌸 MADOKAMI — 25
+// 🌸 MADOKAMI
 // ============================================================
 
-register("🌸 Madokami", "about", async (m) => {
-  return m.reply({
+command(["about", "bot"], async (message) => {
+  await message.reply({
     embeds: [
       embed(
-        "🌸 Madokami",
-        "Bot multifunción para Discord con economía, niveles, diversión, utilidades, moderación y funciones de IA."
+        "🌸 MADOKAMI",
+        "Bot multifunción para Discord.\n\n" +
+        `⚙️ Prefijo: \`${PREFIX}\`\n` +
+        `📚 Comandos: **${commands.size}**\n` +
+        `🤖 IA: **Disponible si OPENAI_API_KEY está configurada**`
       )
     ]
   });
-}, "Sobre Madokami.");
+});
 
-register("🌸 Madokami", "prefix", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "⌨️ Prefix",
-        `El prefix actual es **${PREFIX}**`
-      )
-    ]
-  });
-}, "Prefix.");
+command(["prefix"], async (message) => {
+  await message.reply(`🌸 El prefijo de Madokami es **${PREFIX}**`);
+});
 
-register("🌸 Madokami", "commands", async (m) => {
-  return m.reply("Usa `m!help` para abrir el menú.");
-}, "Lista de comandos.");
+command(["commands", "commandsinfo"], async (message) => {
+  await message.reply(
+    `📚 Madokami tiene **${commands.size} comandos registrados**.\n` +
+    `Usa \`${PREFIX}help\` para verlos.`
+  );
+});
 
-register("🌸 Madokami", "status", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "🟢 Estado",
-        "Madokami está funcionando correctamente."
-      )
-    ]
-  });
-}, "Estado.");
+command(["status", "statusbot"], async (message) => {
+  await message.reply(
+    `🟢 Madokami está funcionando.\n🏓 Ping: **${client.ws.ping}ms**`
+  );
+});
 
-register("🌸 Madokami", "server", async (m) => {
-  return m.reply(`🌸 Madokami está activo en **${client.guilds.cache.size} servidores**.`);
-}, "Servidores.");
+command(["version"], async (message) => {
+  await message.reply("🌸 Madokami v1.0.0");
+});
 
-register("🌸 Madokami", "bot", async (m) => {
-  return commands.get("about").handler(m, []);
-}, "Información del bot.");
+command(["uptimebot"], async (message) => {
+  await message.reply(
+    `⏱️ Madokami lleva **${Math.floor(process.uptime() / 60)} minutos** online.`
+  );
+});
 
-register("🌸 Madokami", "version", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "📦 Versión",
-        "Madokami **1.0.0**"
-      )
-    ]
-  });
-}, "Versión.");
+command(["stats"], async (message) => {
+  await message.reply(
+    `📊 Servidores: **${client.guilds.cache.size}**\n` +
+    `👥 Usuarios aproximados: **${client.guilds.cache.reduce((a, g) => a + g.memberCount, 0)}**\n` +
+    `⚙️ Comandos: **${commands.size}**`
+  );
+});
 
-register("🌸 Madokami", "statusbot", async (m) => {
-  return commands.get("status").handler(m, []);
-}, "Estado del bot.");
+command(["github"], async (message) => {
+  await message.reply(
+    "🐙 No hay un repositorio público configurado para Madokami."
+  );
+});
 
-register("🌸 Madokami", "stats", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "📊 Estadísticas",
-        `Servidores: **${client.guilds.cache.size}**\n` +
-        `Usuarios: **${client.guilds.cache.reduce((a, g) => a + g.memberCount, 0)}**`
-      )
-    ]
-  });
-}, "Estadísticas.");
+command(["developer"], async (message) => {
+  await message.reply("👨‍💻 Proyecto: **Madokami**");
+});
 
-register("🌸 Madokami", "commandsinfo", async (m) => {
-  const total = [...commands.keys()].length;
+command(["support"], async (message) => {
+  await message.reply(
+    "💗 Para soporte, utiliza el servidor donde está instalado Madokami."
+  );
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "📚 Comandos",
-        `Madokami tiene **${total} comandos registrados**.`
-      )
-    ]
-  });
-}, "Cantidad de comandos.");
+command(["pingbot", "latency"], async (message) => {
+  await message.reply(`🏓 Latencia: **${client.ws.ping}ms**`);
+});
 
-register("🌸 Madokami", "developer", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "👨‍💻 Developer",
-        "Proyecto Madokami."
-      )
-    ]
-  });
-}, "Developer.");
+command(["servers"], async (message) => {
+  await message.reply(
+    `🌐 Madokami está en **${client.guilds.cache.size} servidores**.`
+  );
+});
 
-register("🌸 Madokami", "github", async (m) => {
-  return m.reply({
-    embeds: [
-      embed(
-        "💻 GitHub",
-        "El código de Madokami está administrado por su desarrollador."
-      )
-    ]
-  });
-}, "GitHub.");
-
-register("🌸 Madokami", "support", async (m) => {
-  return commands.get("support").handler(m, []);
-}, "Soporte.");
-
-register("🌸 Madokami", "help", async (m) => {
-  return showHelp(m);
-}, "Ayuda.");
-
-register("🌸 Madokami", "pingbot", async (m) => {
-  return commands.get("ping").handler(m, []);
-}, "Ping.");
-
-register("🌸 Madokami", "uptimebot", async (m) => {
-  return commands.get("uptime").handler(m, []);
-}, "Uptime.");
-
-register("🌸 Madokami", "servers", async (m) => {
-  return m.reply(`🌐 Servidores: **${client.guilds.cache.size}**`);
-}, "Servidores.");
-
-register("🌸 Madokami", "users", async (m) => {
+command(["users"], async (message) => {
   const users = client.guilds.cache.reduce(
     (total, guild) => total + guild.memberCount,
     0
   );
 
-  return m.reply(`👥 Usuarios aproximados: **${users}**`);
-}, "Usuarios.");
+  await message.reply(`👥 Usuarios aproximados: **${users}**`);
+});
 
-register("🌸 Madokami", "channels", async (m) => {
-  const count = client.guilds.cache.reduce(
+command(["channelsbot"], async (message) => {
+  const channels = client.guilds.cache.reduce(
     (total, guild) => total + guild.channels.cache.size,
     0
   );
 
-  return m.reply(`📚 Canales: **${count}**`);
-}, "Canales.");
+  await message.reply(`📚 Canales visibles: **${channels}**`);
+});
 
-register("🌸 Madokami", "latency", async (m) => {
-  return m.reply(`🏓 Latencia: **${client.ws.ping}ms**`);
-}, "Latencia.");
+command(["library"], async (message) => {
+  await message.reply("📚 Biblioteca principal: **discord.js v14**.");
+});
 
-register("🌸 Madokami", "library", async (m) => {
-  return m.reply("📦 Biblioteca: **discord.js v14**");
-}, "Biblioteca.");
+command(["node"], async (message) => {
+  await message.reply(`🟢 Node.js: **${process.version}**`);
+});
 
-register("🌸 Madokami", "node", async (m) => {
-  return m.reply(`🟢 Node.js: **${process.version}**`);
-}, "Versión Node.");
+command(["runtime"], async (message) => {
+  await message.reply(`⚙️ Runtime: **${process.platform} ${process.arch}**`);
+});
 
-register("🌸 Madokami", "runtime", async (m) => {
-  return m.reply(`⏱️ Runtime: **${formatDuration(client.uptime)}**`);
-}, "Runtime.");
+command(["memory"], async (message) => {
+  const memory = process.memoryUsage();
 
-register("🌸 Madokami", "memory", async (m) => {
-  const mem = process.memoryUsage();
+  await message.reply(
+    `🧠 RAM usada: **${Math.round(memory.rss / 1024 / 1024)} MB**`
+  );
+});
 
-  return m.reply({
-    embeds: [
-      embed(
-        "🧠 Memoria",
-        `RAM usada: **${(mem.rss / 1024 / 1024).toFixed(2)} MB**`
-      )
-    ]
-  });
-}, "Memoria.");
+command(["config"], async (message) => {
+  const config = getGuild(message.guild.id).config;
 
-register("🌸 Madokami", "config", async (m) => {
-  const c = guildData(m.guild.id).config;
-
-  return m.reply({
+  await message.reply({
     embeds: [
       embed(
         "⚙️ Configuración",
-        `Anti-link: **${c.antiLink ? "ON" : "OFF"}**\n` +
-        `Anti-spam: **${c.antiSpam ? "ON" : "OFF"}**\n` +
-        `Welcome: **${c.welcome ? "ON" : "OFF"}**\n` +
-        `Logs: **${c.logChannel ? `<#${c.logChannel}>` : "OFF"}**`
+        `🔗 Anti-link: **${config.antiLink ? "ON" : "OFF"}**\n` +
+        `🚫 Anti-spam: **${config.antiSpam ? "ON" : "OFF"}**\n` +
+        `👋 Welcome: **${config.welcome ? "ON" : "OFF"}**\n` +
+        `📋 Logs: **${config.logChannel ? `<#${config.logChannel}>` : "OFF"}**`
       )
     ]
   });
-}, "Configuración.");
+});
 
 // ============================================================
-// 🤖 IA — 3 COMANDOS
+// 🤖 IA
 // ============================================================
 
-async function aiText(prompt) {
+async function askAI(prompt) {
   if (!openai) {
-    throw new Error("OPENAI_API_KEY no configurada.");
+    throw new Error(
+      "OPENAI_API_KEY no está disponible en el entorno."
+    );
   }
 
   const response = await openai.responses.create({
@@ -2423,161 +1808,697 @@ async function aiText(prompt) {
     input: prompt
   });
 
-  return response.output_text || "La IA no devolvió una respuesta.";
+  return response.output_text || "No recibí una respuesta de la IA.";
 }
 
-register("🤖 IA", "ia", async (m, args) => {
-  if (!openai) {
-    return m.reply({
-      embeds: [
-        errorEmbed(
-          "La IA no está configurada. Añade `OPENAI_API_KEY` en Render."
-        )
-      ]
-    });
-  }
-
-  const question = args.join(" ");
-
-  if (!question) {
-    return m.reply("Usa `m!ia <pregunta>`.");
-  }
-
-  try {
-    await m.channel.sendTyping();
-
-    const answer = await aiText(
-      `Responde en español de forma clara y útil.\n\nPregunta del usuario:\n${question}`
-    );
-
-    const chunks = answer.match(/[\s\S]{1,3900}/g) || [answer];
-
-    for (const chunk of chunks.slice(0, 3)) {
-      await m.channel.send({
-        embeds: [
-          embed("🤖 Madokami IA", chunk)
-        ]
-      });
-    }
-  } catch (err) {
-    console.error("IA:", err);
-
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude contactar con la IA en este momento.")
-      ]
-    });
-  }
-}, "IA general: preguntas, matemáticas, explicaciones, código, etc.");
-
-register("🤖 IA", "ask", async (m, args) => {
-  if (!openai) {
-    return m.reply({
-      embeds: [
-        errorEmbed(
-          "La IA no está configurada. Añade `OPENAI_API_KEY` en Render."
-        )
-      ]
-    });
-  }
-
-  const question = args.join(" ");
-
-  if (!question) {
-    return m.reply("Usa `m!ask <pregunta>`.");
-  }
-
-  try {
-    await m.channel.sendTyping();
-
-    const answer = await aiText(
-      `Responde brevemente en español.\nPregunta: ${question}`
-    );
-
-    return m.reply({
-      embeds: [
-        embed("💬 Respuesta", truncate(answer, 3900))
-      ]
-    });
-  } catch (err) {
-    console.error("ASK:", err);
-
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude obtener una respuesta.")
-      ]
-    });
-  }
-}, "Pregunta rápida a la IA.");
-
-register("🤖 IA", "imagen", async (m, args) => {
-  if (!openai) {
-    return m.reply({
-      embeds: [
-        errorEmbed(
-          "La generación de imágenes no está configurada. Añade `OPENAI_API_KEY` en Render."
-        )
-      ]
-    });
-  }
-
-  const prompt = args.join(" ");
+command(["ia"], async (message) => {
+  const prompt = message.args?.slice(1).join(" ");
 
   if (!prompt) {
-    return m.reply("Usa `m!imagen <descripción>`.");
+    return message.reply(
+      "🤖 Uso: `m!ia tu pregunta`"
+    );
   }
 
-  try {
-    await m.channel.sendTyping();
+  const remaining = getCooldown(
+    `${message.guild.id}:${message.author.id}:ia`,
+    10
+  );
 
+  if (remaining) {
+    return message.reply(
+      `⏳ Espera ${remaining}s antes de usar IA otra vez.`
+    );
+  }
+
+  if (!openai) {
+    return message.reply(
+      "❌ `OPENAI_API_KEY` no está disponible en Render."
+    );
+  }
+
+  await message.channel.sendTyping();
+
+  try {
+    const answer = await askAI(prompt);
+
+    await sendLong(
+      message,
+      `🤖 **Madokami IA**\n\n${answer}`
+    );
+  } catch (error) {
+    console.error("OPENAI IA ERROR:", error);
+
+    await message.reply(
+      `❌ No pude contactar con la IA.\n` +
+      `📋 Revisa los **Logs de Render** para ver el error exacto.`
+    );
+  }
+});
+
+command(["ask"], async (message) => {
+  const prompt = message.args?.slice(1).join(" ");
+
+  if (!prompt) {
+    return message.reply(
+      "🤖 Uso: `m!ask pregunta`"
+    );
+  }
+
+  const remaining = getCooldown(
+    `${message.guild.id}:${message.author.id}:ask`,
+    10
+  );
+
+  if (remaining) {
+    return message.reply(
+      `⏳ Espera ${remaining}s.`
+    );
+  }
+
+  if (!openai) {
+    return message.reply(
+      "❌ `OPENAI_API_KEY` no está disponible en Render."
+    );
+  }
+
+  await message.channel.sendTyping();
+
+  try {
+    const answer = await askAI(
+      `Responde de forma clara y directa a esta pregunta:\n${prompt}`
+    );
+
+    await sendLong(
+      message,
+      `🤖 **Respuesta**\n\n${answer}`
+    );
+  } catch (error) {
+    console.error("OPENAI ASK ERROR:", error);
+
+    await message.reply(
+      "❌ No pude obtener una respuesta. Revisa los Logs de Render."
+    );
+  }
+});
+
+command(["imagen"], async (message) => {
+  const prompt = message.args?.slice(1).join(" ");
+
+  if (!prompt) {
+    return message.reply(
+      "🖼️ Uso: `m!imagen descripción`"
+    );
+  }
+
+  const remaining = getCooldown(
+    `${message.guild.id}:${message.author.id}:imagen`,
+    30
+  );
+
+  if (remaining) {
+    return message.reply(
+      `⏳ Espera ${remaining}s antes de generar otra imagen.`
+    );
+  }
+
+  if (!openai) {
+    return message.reply(
+      "❌ `OPENAI_API_KEY` no está disponible en Render."
+    );
+  }
+
+  const loading = await message.reply(
+    "🖼️ Generando tu imagen... espera un momento."
+  );
+
+  try {
     const result = await openai.images.generate({
       model: "gpt-image-2",
       prompt
     });
 
-    const base64 = result.data?.[0]?.b64_json;
+    const imageBase64 = result.data?.[0]?.b64_json;
 
-    if (!base64) {
-      return m.reply({
-        embeds: [
-          errorEmbed("La IA no devolvió ninguna imagen.")
-        ]
-      });
+    if (!imageBase64) {
+      throw new Error("OpenAI no devolvió una imagen.");
     }
 
-    const buffer = Buffer.from(base64, "base64");
+    const buffer = Buffer.from(imageBase64, "base64");
 
     const attachment = new AttachmentBuilder(buffer, {
       name: "madokami-image.png"
     });
 
-    return m.reply({
-      embeds: [
-        embed(
-          "🎨 Imagen generada",
-          `Prompt: ${truncate(prompt, 1000)}`
-        )
-      ],
+    await loading.edit({
+      content: "🌸 Imagen generada:",
       files: [attachment]
     });
-  } catch (err) {
-    console.error("IMAGEN:", err);
+  } catch (error) {
+    console.error("OPENAI IMAGE ERROR:", error);
 
-    return m.reply({
-      embeds: [
-        errorEmbed(
-          "No pude generar la imagen. Comprueba que tu API de OpenAI esté configurada y tenga acceso al modelo de imágenes."
-        )
-      ]
+    await loading.edit({
+      content:
+        "❌ No pude generar la imagen.\n" +
+        "📋 Revisa los Logs de Render para ver el error exacto."
     });
   }
-}, "Genera una imagen mediante IA.");
+});
 
 // ============================================================
-// 🔐 ADMINISTRACIÓN
+// 🔐 ADMIN CHECK
 // ============================================================
 
-const adminCommands = [
+async function requireAdmin(message) {
+  if (!isAdmin(message.member)) {
+    await message.reply(
+      "🔒 Este comando es solo para administradores."
+    );
+    return false;
+  }
+
+  return true;
+}
+
+// ============================================================
+// 🛡️ ADMIN — MODERACIÓN
+// ============================================================
+
+command(["ban"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers)) {
+    return message.reply("❌ No tienes permiso para banear.");
+  }
+
+  const member = mentionedMember(message);
+
+  if (!member) {
+    return message.reply("❌ Uso: `m!ban @usuario razón`");
+  }
+
+  if (!member.bannable) {
+    return message.reply("❌ No puedo banear a ese usuario.");
+  }
+
+  const reason =
+    message.args?.slice(2).join(" ") || "Sin razón especificada";
+
+  await member.ban({ reason });
+
+  await message.reply(`🔨 ${member.user.tag} fue baneado.`);
+
+  await sendLog(
+    message.guild,
+    "Usuario baneado",
+    `👤 Usuario: ${member.user.tag}\n` +
+    `🆔 ID: ${member.id}\n` +
+    `👮 Moderador: ${message.author.tag}\n` +
+    `📝 Razón: ${reason}`,
+    0xFF4444
+  );
+});
+
+command(["unban"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const id = message.args?.[1];
+
+  if (!id) {
+    return message.reply("❌ Uso: `m!unban ID`");
+  }
+
+  try {
+    await message.guild.members.unban(id);
+
+    await message.reply("🔓 Usuario desbaneado.");
+
+    await sendLog(
+      message.guild,
+      "Usuario desbaneado",
+      `🆔 ID: ${id}\n👮 Moderador: ${message.author.tag}`
+    );
+  } catch {
+    await message.reply("❌ No pude quitar el ban.");
+  }
+});
+
+command(["kick"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const member = mentionedMember(message);
+
+  if (!member) {
+    return message.reply("❌ Uso: `m!kick @usuario razón`");
+  }
+
+  if (!member.kickable) {
+    return message.reply("❌ No puedo expulsar a ese usuario.");
+  }
+
+  const reason =
+    message.args?.slice(2).join(" ") || "Sin razón especificada";
+
+  await member.kick(reason);
+
+  await message.reply(`👢 ${member.user.tag} fue expulsado.`);
+
+  await sendLog(
+    message.guild,
+    "Usuario expulsado",
+    `👤 ${member.user.tag}\n👮 ${message.author.tag}\n📝 ${reason}`,
+    0xFF8844
+  );
+});
+
+command(["mute"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const member = mentionedMember(message);
+
+  if (!member) {
+    return message.reply("❌ Uso: `m!mute @usuario`");
+  }
+
+  if (!member.moderatable) {
+    return message.reply("❌ No puedo silenciar a ese usuario.");
+  }
+
+  await member.timeout(
+    2 * 60 * 60 * 1000,
+    `Mute por ${message.author.tag}`
+  );
+
+  await message.reply(
+    `🔇 ${member.user.tag} fue silenciado durante **2 horas**.`
+  );
+
+  await sendLog(
+    message.guild,
+    "Usuario silenciado",
+    `👤 ${member.user.tag}\n👮 ${message.author.tag}\n⏱️ 2 horas`,
+    0xFFAA00
+  );
+});
+
+command(["unmute"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const member = mentionedMember(message);
+
+  if (!member) {
+    return message.reply("❌ Menciona al usuario.");
+  }
+
+  await member.timeout(null);
+
+  await message.reply(`🔊 ${member.user.tag} ya no está silenciado.`);
+
+  await sendLog(
+    message.guild,
+    "Mute eliminado",
+    `👤 ${member.user.tag}\n👮 ${message.author.tag}`
+  );
+});
+
+command(["warn"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const member = mentionedMember(message);
+
+  if (!member) {
+    return message.reply("❌ Uso: `m!warn @usuario razón`");
+  }
+
+  const reason =
+    message.args?.slice(2).join(" ") || "Sin razón especificada";
+
+  const guild = getGuild(message.guild.id);
+
+  if (!guild.warns[member.id]) {
+    guild.warns[member.id] = [];
+  }
+
+  guild.warns[member.id].push({
+    reason,
+    moderator: message.author.id,
+    date: Date.now()
+  });
+
+  scheduleSave();
+
+  await message.reply(
+    `⚠️ ${member.user.tag} recibió un warn.\n📝 ${reason}`
+  );
+
+  await sendLog(
+    message.guild,
+    "Warn aplicado",
+    `👤 ${member.user.tag}\n` +
+    `👮 ${message.author.tag}\n` +
+    `📝 ${reason}`,
+    0xFFAA00
+  );
+});
+
+command(["warnings"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const member = mentionedMember(message) || message.member;
+  const guild = getGuild(message.guild.id);
+  const warns = guild.warns[member.id] || [];
+
+  if (!warns.length) {
+    return message.reply(
+      `✅ ${member.user.tag} no tiene warns.`
+    );
+  }
+
+  const text = warns.map(
+    (w, i) =>
+      `**${i + 1}.** ${w.reason}\n👮 <@${w.moderator}> • <t:${Math.floor(w.date / 1000)}:R>`
+  ).join("\n\n");
+
+  await message.reply({
+    embeds: [
+      embed(
+        `⚠️ Warns de ${member.user.username}`,
+        text
+      )
+    ]
+  });
+});
+
+command(["resetwarnings"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const member = mentionedMember(message);
+
+  if (!member) {
+    return message.reply("❌ Menciona un usuario.");
+  }
+
+  const guild = getGuild(message.guild.id);
+
+  guild.warns[member.id] = [];
+
+  scheduleSave();
+
+  await message.reply("🧹 Warns eliminados.");
+});
+
+command(["clear"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+    return message.reply("❌ No tienes permiso para borrar mensajes.");
+  }
+
+  const amount = Number(message.args?.[1]);
+
+  if (!Number.isInteger(amount) || amount < 1 || amount > 100) {
+    return message.reply("❌ Usa una cantidad entre 1 y 100.");
+  }
+
+  const fetched = await message.channel.messages.fetch({
+    limit: amount
+  });
+
+  const details = fetched
+    .filter(m => !m.author.bot)
+    .map(
+      m =>
+        `👤 ${m.author.tag}: ${m.content || "[sin texto]"}`
+    )
+    .join("\n");
+
+  const deleted = await message.channel.bulkDelete(
+    fetched,
+    true
+  );
+
+  await message.channel.send(
+    `🧹 Eliminados **${deleted.size} mensajes**.`
+  ).then(msg => {
+    setTimeout(() => msg.delete().catch(() => {}), 3000);
+  });
+
+  await sendLog(
+    message.guild,
+    "Mensajes eliminados",
+    `👮 Moderador: ${message.author.tag}\n` +
+    `📚 Cantidad: ${deleted.size}\n\n` +
+    (details || "Sin contenido disponible."),
+    0xFF8844
+  );
+});
+
+command(["slowmode"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const seconds = Number(message.args?.[1]);
+
+  if (!Number.isInteger(seconds) || seconds < 0 || seconds > 21600) {
+    return message.reply("❌ Usa entre 0 y 21600 segundos.");
+  }
+
+  await message.channel.setRateLimitPerUser(seconds);
+
+  await message.reply(
+    `🐌 Slowmode establecido en **${seconds}s**.`
+  );
+
+  await sendLog(
+    message.guild,
+    "Slowmode cambiado",
+    `📚 Canal: ${message.channel}\n` +
+    `⏱️ ${seconds}s\n` +
+    `👮 ${message.author.tag}`
+  );
+});
+
+command(["lock"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  await message.channel.permissionOverwrites.edit(
+    message.guild.roles.everyone,
+    {
+      SendMessages: false
+    }
+  );
+
+  await message.reply("🔒 Canal bloqueado.");
+
+  await sendLog(
+    message.guild,
+    "Canal bloqueado",
+    `📚 ${message.channel}\n👮 ${message.author.tag}`
+  );
+});
+
+command(["unlock"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  await message.channel.permissionOverwrites.edit(
+    message.guild.roles.everyone,
+    {
+      SendMessages: null
+    }
+  );
+
+  await message.reply("🔓 Canal desbloqueado.");
+
+  await sendLog(
+    message.guild,
+    "Canal desbloqueado",
+    `📚 ${message.channel}\n👮 ${message.author.tag}`
+  );
+});
+
+// ============================================================
+// 🔗 ANTI LINK
+// ============================================================
+
+command(["antilink"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const value = message.args?.[1]?.toLowerCase();
+
+  if (!["on", "off"].includes(value)) {
+    return message.reply("❌ Usa `m!antilink on` o `m!antilink off`.");
+  }
+
+  const guild = getGuild(message.guild.id);
+
+  guild.config.antiLink = value === "on";
+
+  scheduleSave();
+
+  await message.reply(
+    `🔗 Anti-link: **${guild.config.antiLink ? "ACTIVADO" : "DESACTIVADO"}**`
+  );
+
+  await sendLog(
+    message.guild,
+    "Anti-link cambiado",
+    `Estado: ${guild.config.antiLink ? "ON" : "OFF"}\n👮 ${message.author.tag}`
+  );
+});
+
+command(["antispam"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const value = message.args?.[1]?.toLowerCase();
+
+  if (!["on", "off"].includes(value)) {
+    return message.reply("❌ Usa `m!antispam on` o `m!antispam off`.");
+  }
+
+  const guild = getGuild(message.guild.id);
+
+  guild.config.antiSpam = value === "on";
+
+  scheduleSave();
+
+  await message.reply(
+    `🚫 Anti-spam: **${guild.config.antiSpam ? "ACTIVADO" : "DESACTIVADO"}**`
+  );
+});
+
+// ============================================================
+// 📝 LOG
+// ============================================================
+
+command(["log"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const arg = message.args?.[1];
+
+  const guild = getGuild(message.guild.id);
+
+  if (!arg) {
+    return message.reply(
+      "❌ Usa `m!log #canal` o `m!log off`."
+    );
+  }
+
+  if (arg.toLowerCase() === "off") {
+    guild.config.logChannel = null;
+    scheduleSave();
+
+    return message.reply("📋 Logs desactivados.");
+  }
+
+  const channel = message.mentions.channels.first();
+
+  if (!channel) {
+    return message.reply("❌ Menciona un canal.");
+  }
+
+  guild.config.logChannel = channel.id;
+
+  scheduleSave();
+
+  await message.reply(
+    `📋 Logs configurados en ${channel}.`
+  );
+
+  await sendLog(
+    message.guild,
+    "Sistema de logs activado",
+    `👮 ${message.author.tag}`
+  );
+});
+
+// ============================================================
+// 👋 WELCOME
+// ============================================================
+
+command(["welcome"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const value = message.args?.[1]?.toLowerCase();
+
+  if (!["on", "off"].includes(value)) {
+    return message.reply("❌ Usa `m!welcome on` o `m!welcome off`.");
+  }
+
+  const guild = getGuild(message.guild.id);
+
+  guild.config.welcome = value === "on";
+
+  scheduleSave();
+
+  await message.reply(
+    `👋 Bienvenida: **${guild.config.welcome ? "ACTIVADA" : "DESACTIVADA"}**`
+  );
+});
+
+command(["welcomechannel"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const channel = message.mentions.channels.first();
+
+  if (!channel) {
+    return message.reply("❌ Menciona un canal.");
+  }
+
+  const guild = getGuild(message.guild.id);
+
+  guild.config.welcomeChannel = channel.id;
+
+  scheduleSave();
+
+  await message.reply(
+    `👋 Canal de bienvenida: ${channel}`
+  );
+});
+
+command(["welcomemessage"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const text = message.args?.slice(1).join(" ");
+
+  if (!text) {
+    return message.reply(
+      "❌ Uso: `m!welcomemessage Bienvenido {user} a {server}`"
+    );
+  }
+
+  const guild = getGuild(message.guild.id);
+
+  guild.config.welcomeMessage = text;
+
+  scheduleSave();
+
+  await message.reply("👋 Mensaje de bienvenida actualizado.");
+});
+
+command(["autorole"], async (message) => {
+  if (!(await requireAdmin(message))) return;
+
+  const role = message.mentions.roles.first();
+
+  if (!role) {
+    return message.reply("❌ Menciona un rol.");
+  }
+
+  const guild = getGuild(message.guild.id);
+
+  guild.config.autoRole = role.id;
+
+  scheduleSave();
+
+  await message.reply(
+    `🎭 Autorole configurado: ${role}`
+  );
+});
+
+// ============================================================
+// 🛡️ ADMIN HELP
+// ============================================================
+
+const ADMIN_COMMANDS = [
   "ban",
   "unban",
   "kick",
@@ -2585,879 +2506,313 @@ const adminCommands = [
   "unmute",
   "warn",
   "warnings",
+  "resetwarnings",
   "clear",
   "slowmode",
+  "lock",
+  "unlock",
   "antilink",
   "antispam",
   "log",
-  "lock",
-  "unlock",
   "welcome",
   "welcomechannel",
   "welcomemessage",
-  "autorole",
-  "setprefix",
-  "config"
+  "autorole"
 ];
 
-function adminOnly(m) {
-  if (!isAdmin(m.member)) {
-    m.reply({
-      embeds: [
-        errorEmbed("🔒 Necesitas permisos de administrador.")
-      ]
-    });
+command(["helpad"], async (message) => {
+  if (!(await requireAdmin(message))) return;
 
-    return false;
-  }
-
-  return true;
-}
-
-async function moderationLog(m, action, target, reason) {
-  await sendLog(
-    m.guild,
-    `🛡️ ${action}`,
-    `**Moderador:** ${m.author.tag}\n` +
-    `**Usuario:** ${target || "N/A"}\n` +
-    `**Canal:** ${m.channel}\n` +
-    `**Razón:** ${reason || "Sin razón"}`,
-    0xFFB347
-  );
-}
-
-async function moderationAction(m, args, action) {
-  if (!adminOnly(m)) return;
-
-  const target = mentionUser(m, args);
-
-  if (!target) {
-    return m.reply({
-      embeds: [
-        errorEmbed(`Usa \`m!${action} @usuario razón\`.`)
-      ]
-    });
-  }
-
-  const reason = reasonFrom(args);
-
-  try {
-    if (action === "ban") {
-      await target.ban({ reason });
-    }
-
-    if (action === "kick") {
-      await target.kick(reason);
-    }
-
-    await moderationLog(m, action.toUpperCase(), target.user.tag, reason);
-
-    return m.reply({
-      embeds: [
-        successEmbed(`✅ ${target.user.tag} ha sido ${action === "ban" ? "baneado" : "expulsado"}.`)
-      ]
-    });
-  } catch (err) {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude realizar la acción. Revisa mis permisos y mi posición de rol.")
-      ]
-    });
-  }
-}
-
-registerAdmin("ban", async (m, args) => {
-  return moderationAction(m, args, "ban");
-});
-
-registerAdmin("kick", async (m, args) => {
-  return moderationAction(m, args, "kick");
-});
-
-function registerAdmin(name, handler) {
-  commands.set(name, {
-    name,
-    category: "🔐 Administración",
-    handler,
-    description: "Comando administrativo."
-  });
-}
-
-registerAdmin("unban", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const id = args[0];
-
-  if (!id) return m.reply("Usa `m!unban ID`.");
-
-  try {
-    await m.guild.members.unban(id);
-
-    await sendLog(
-      m.guild,
-      "🔓 UNBAN",
-      `**Moderador:** ${m.author.tag}\n**Usuario ID:** ${id}`
-    );
-
-    return m.reply({
-      embeds: [
-        successEmbed(`Usuario **${id}** desbaneado.`)
-      ]
-    });
-  } catch {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude quitar el ban. Comprueba la ID.")
-      ]
-    });
-  }
-});
-
-registerAdmin("mute", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const target = mentionUser(m, args);
-
-  if (!target) return m.reply("Usa `m!mute @usuario razón`.");
-
-  const reason = reasonFrom(args);
-
-  try {
-    await target.timeout(2 * 60 * 60 * 1000, reason);
-
-    await moderationLog(
-      m,
-      "MUTE",
-      target.user.tag,
-      reason
-    );
-
-    return m.reply({
-      embeds: [
-        successEmbed(
-          `🔇 ${target.user.tag} fue silenciado durante **2 horas**.`
-        )
-      ]
-    });
-  } catch {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude silenciar al usuario.")
-      ]
-    });
-  }
-});
-
-registerAdmin("unmute", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const target = mentionUser(m, args);
-
-  if (!target) return m.reply("Usa `m!unmute @usuario`.");
-
-  try {
-    await target.timeout(null, "Unmute manual");
-
-    await moderationLog(
-      m,
-      "UNMUTE",
-      target.user.tag,
-      "Unmute manual"
-    );
-
-    return m.reply({
-      embeds: [
-        successEmbed(`🔊 ${target.user.tag} ya no está silenciado.`)
-      ]
-    });
-  } catch {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude quitar el silencio.")
-      ]
-    });
-  }
-});
-
-registerAdmin("warn", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const target = mentionUser(m, args);
-
-  if (!target) return m.reply("Usa `m!warn @usuario razón`.");
-
-  const reason = reasonFrom(args);
-  const g = guildData(m.guild.id);
-
-  if (!g.warns[target.id]) {
-    g.warns[target.id] = [];
-  }
-
-  g.warns[target.id].push({
-    moderator: m.author.id,
-    reason,
-    at: Date.now()
-  });
-
-  saveDB();
-
-  await moderationLog(
-    m,
-    "WARN",
-    target.user.tag,
-    reason
+  const lines = ADMIN_COMMANDS.map(
+    (cmd, i) => `**${i + 1}.** \`${PREFIX}${cmd}\``
   );
 
-  return m.reply({
-    embeds: [
-      successEmbed(`⚠️ ${target.user.tag} recibió un warn.`)
-    ]
-  });
-});
-
-registerAdmin("warnings", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const target = mentionUser(m, args) || m.member;
-  const warns = guildData(m.guild.id).warns[target.id] || [];
-
-  const text = warns.length
-    ? warns.map((w, i) =>
-        `**${i + 1}.** ${w.reason} — <@${w.moderator}>`
-      ).join("\n")
-    : "Sin advertencias.";
-
-  return m.reply({
-    embeds: [
-      embed(`⚠️ Warnings de ${target.user.username}`, text)
-    ]
-  });
-});
-
-registerAdmin("clear", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const amount = Number(args[0]);
-
-  if (!Number.isInteger(amount) || amount < 1 || amount > 100) {
-    return m.reply("Usa `m!clear 1-100`.");
-  }
-
-  try {
-    const messages = await m.channel.messages.fetch({
-      limit: amount
-    });
-
-    const deleted = await m.channel.bulkDelete(messages, true);
-
-    const logText = [...messages.values()]
-      .slice(0, 20)
-      .map(x =>
-        `• **${x.author?.tag || "Desconocido"}:** ${truncate(x.content || "[sin texto]", 120)}`
-      )
-      .join("\n");
-
-    await sendLog(
-      m.guild,
-      "🧹 CLEAR",
-      `**Moderador:** ${m.author.tag}\n` +
-      `**Canal:** ${m.channel}\n` +
-      `**Mensajes eliminados:** ${deleted.size}\n\n` +
-      `**Contenido registrado:**\n${logText || "No disponible."}`,
-      0xFFB347
-    );
-
-    const confirmation = await m.channel.send({
-      embeds: [
-        successEmbed(`🧹 Eliminados **${deleted.size} mensajes**.`)
-      ]
-    });
-
-    setTimeout(() => confirmation.delete().catch(() => {}), 3000);
-  } catch {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude eliminar los mensajes.")
-      ]
-    });
-  }
-});
-
-registerAdmin("slowmode", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const seconds = Number(args[0]);
-
-  if (!Number.isInteger(seconds) || seconds < 0 || seconds > 21600) {
-    return m.reply("Usa un valor entre 0 y 21600 segundos.");
-  }
-
-  try {
-    await m.channel.setRateLimitPerUser(seconds);
-
-    await sendLog(
-      m.guild,
-      "🐌 SLOWMODE",
-      `**Moderador:** ${m.author.tag}\n**Canal:** ${m.channel}\n**Nuevo valor:** ${seconds}s`
-    );
-
-    return m.reply({
-      embeds: [
-        successEmbed(`🐌 Slowmode establecido en **${seconds}s**.`)
-      ]
-    });
-  } catch {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude cambiar el slowmode.")
-      ]
-    });
-  }
-});
-
-registerAdmin("antilink", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const value = args[0]?.toLowerCase();
-
-  if (!["on", "off"].includes(value)) {
-    return m.reply("Usa `m!antilink on` o `m!antilink off`.");
-  }
-
-  guildData(m.guild.id).config.antiLink = value === "on";
-  saveDB();
-
-  await sendLog(
-    m.guild,
-    "🔗 ANTILINK",
-    `**Moderador:** ${m.author.tag}\n**Estado:** ${value.toUpperCase()}`
-  );
-
-  return m.reply({
-    embeds: [
-      successEmbed(`🔗 Anti-link: **${value.toUpperCase()}**`)
-    ]
-  });
-});
-
-registerAdmin("antispam", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const value = args[0]?.toLowerCase();
-
-  if (!["on", "off"].includes(value)) {
-    return m.reply("Usa `m!antispam on` o `m!antispam off`.");
-  }
-
-  guildData(m.guild.id).config.antiSpam = value === "on";
-  saveDB();
-
-  await sendLog(
-    m.guild,
-    "🚨 ANTISPAM",
-    `**Moderador:** ${m.author.tag}\n**Estado:** ${value.toUpperCase()}`
-  );
-
-  return m.reply({
-    embeds: [
-      successEmbed(`🚨 Anti-spam: **${value.toUpperCase()}**`)
-    ]
-  });
-});
-
-registerAdmin("log", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  if (args[0]?.toLowerCase() === "off") {
-    guildData(m.guild.id).config.logChannel = null;
-    saveDB();
-
-    return m.reply({
-      embeds: [
-        successEmbed("📋 Sistema de logs desactivado.")
-      ]
-    });
-  }
-
-  const channel = m.mentions.channels.first();
-
-  if (!channel || !channel.isTextBased()) {
-    return m.reply("Usa `m!log #canal` o `m!log off`.");
-  }
-
-  guildData(m.guild.id).config.logChannel = channel.id;
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`📋 Logs configurados en ${channel}.`)
-    ]
-  });
-});
-
-registerAdmin("lock", async (m) => {
-  if (!adminOnly(m)) return;
-
-  if (!m.channel.isTextBased()) return;
-
-  try {
-    await m.channel.permissionOverwrites.edit(
-      m.guild.roles.everyone,
-      {
-        SendMessages: false
-      }
-    );
-
-    await sendLog(
-      m.guild,
-      "🔒 LOCK",
-      `**Moderador:** ${m.author.tag}\n**Canal:** ${m.channel}`
-    );
-
-    return m.reply({
-      embeds: [
-        successEmbed("🔒 Canal bloqueado.")
-      ]
-    });
-  } catch {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude bloquear el canal.")
-      ]
-    });
-  }
-});
-
-registerAdmin("unlock", async (m) => {
-  if (!adminOnly(m)) return;
-
-  try {
-    await m.channel.permissionOverwrites.edit(
-      m.guild.roles.everyone,
-      {
-        SendMessages: null
-      }
-    );
-
-    await sendLog(
-      m.guild,
-      "🔓 UNLOCK",
-      `**Moderador:** ${m.author.tag}\n**Canal:** ${m.channel}`
-    );
-
-    return m.reply({
-      embeds: [
-        successEmbed("🔓 Canal desbloqueado.")
-      ]
-    });
-  } catch {
-    return m.reply({
-      embeds: [
-        errorEmbed("No pude desbloquear el canal.")
-      ]
-    });
-  }
-});
-
-registerAdmin("welcome", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const value = args[0]?.toLowerCase();
-
-  if (!["on", "off"].includes(value)) {
-    return m.reply("Usa `m!welcome on` o `m!welcome off`.");
-  }
-
-  guildData(m.guild.id).config.welcome = value === "on";
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`🌸 Bienvenida: **${value.toUpperCase()}**`)
-    ]
-  });
-});
-
-registerAdmin("welcomechannel", async (m) => {
-  if (!adminOnly(m)) return;
-
-  const channel = m.mentions.channels.first();
-
-  if (!channel) {
-    return m.reply("Usa `m!welcomechannel #canal`.");
-  }
-
-  guildData(m.guild.id).config.welcomeChannel = channel.id;
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`🌸 Canal de bienvenida: ${channel}`)
-    ]
-  });
-});
-
-registerAdmin("welcomemessage", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const text = args.join(" ");
-
-  if (!text) {
-    return m.reply(
-      "Usa `m!welcomemessage Bienvenido {user} a {server}`."
-    );
-  }
-
-  guildData(m.guild.id).config.welcomeMessage = text;
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed("🌸 Mensaje de bienvenida actualizado.")
-    ]
-  });
-});
-
-registerAdmin("autorole", async (m) => {
-  if (!adminOnly(m)) return;
-
-  const role = m.mentions.roles.first();
-
-  if (!role) {
-    return m.reply("Usa `m!autorole @rol`.");
-  }
-
-  guildData(m.guild.id).config.autoRole = role.id;
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`🎭 Auto-rol configurado: ${role}`)
-    ]
-  });
-});
-
-registerAdmin("setprefix", async (m, args) => {
-  if (!adminOnly(m)) return;
-
-  const newPrefix = args[0];
-
-  if (!newPrefix || newPrefix.length > 5) {
-    return m.reply("El prefix debe tener entre 1 y 5 caracteres.");
-  }
-
-  guildData(m.guild.id).config.prefix = newPrefix;
-  saveDB();
-
-  return m.reply({
-    embeds: [
-      successEmbed(`Prefix cambiado a **${newPrefix}**.`)
-    ]
-  });
-});
-
-registerAdmin("config", async (m) => {
-  if (!adminOnly(m)) return;
-
-  return commands.get("config").handler(m, []);
-});
-
-// ============================================================
-// HELP
-// ============================================================
-
-function categoryEmoji(category) {
-  return category.split(" ")[0];
-}
-
-async function showHelp(m) {
-  const options = Object.keys(categories).map(category => ({
-    label: category.replace(/^[^\s]+\s/, ""),
-    value: category,
-    emoji: categoryEmoji(category)
-  }));
-
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId("madokami_help")
-    .setPlaceholder("🌸 Selecciona una categoría")
-    .addOptions(options);
-
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return m.reply({
-    embeds: [
-      embed(
-        "🌸 MADOKAMI — AYUDA",
-        "Selecciona una categoría para ver sus comandos.\n\n" +
-        "🔐 Los comandos administrativos están separados en `m!helpad`."
-      )
-    ],
-    components: [row]
-  });
-}
-
-async function showAdminHelp(m) {
-  if (!isAdmin(m.member)) {
-    return m.reply({
-      embeds: [
-        errorEmbed("🔒 Solo administradores pueden usar `m!helpad`.")
-      ]
-    });
-  }
-
-  const list = adminCommands
-    .map((x, i) => `**${i + 1}.** \`${PREFIX}${x}\``)
-    .join("\n");
-
-  return m.reply({
+  await message.reply({
     embeds: [
       embed(
         "🔐 MADOKAMI — ADMIN",
-        list +
-        "\n\n🛡️ Estos comandos requieren permisos de administrador."
+        "Comandos exclusivos para administradores.\n\n" +
+        lines.join("\n")
       )
     ]
   });
-}
+});
 
 // ============================================================
-// EVENTOS
+// 🌸 HELP MENU
+// ============================================================
+
+function createHelpMenu() {
+  const options = Object.keys(PUBLIC_COMMANDS).map(
+    category => ({
+      label: category.replace(/^.\s/, ""),
+      value: category,
+      description: `${PUBLIC_COMMANDS[category].length} comandos`
+    })
+  );
+
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("madokami_help")
+      .setPlaceholder("🌸 Selecciona una categoría")
+      .addOptions(options)
+  );
+}
+
+command(["help"], async (message) => {
+  const helpEmbed = new EmbedBuilder()
+    .setColor(0xE8A7FF)
+    .setTitle("🌸 MADOKAMI — AYUDA")
+    .setDescription(
+      "Selecciona una categoría para ver sus comandos.\n\n" +
+      "🔐 Los comandos administrativos están separados en `m!helpad`."
+    )
+    .setTimestamp();
+
+  await message.reply({
+    embeds: [helpEmbed],
+    components: [createHelpMenu()]
+  });
+});
+
+// ============================================================
+// HELP INTERACTION — FIX DEL TIMEOUT
+// ============================================================
+
+client.on(
+  Events.InteractionCreate,
+  async interaction => {
+    if (!interaction.isStringSelectMenu()) return;
+
+    if (interaction.customId !== "madokami_help") return;
+
+    try {
+      await interaction.deferReply({
+        ephemeral: true
+      });
+
+      const category = interaction.values[0];
+      const list = PUBLIC_COMMANDS[category];
+
+      if (!list) {
+        return interaction.editReply({
+          embeds: [
+            errorEmbed("Categoría no encontrada.")
+          ]
+        });
+      }
+
+      const lines = list.map(
+        (cmd, index) =>
+          `**${index + 1}.** \`${PREFIX}${cmd}\``
+      );
+
+      const categoryEmbed = new EmbedBuilder()
+        .setColor(0xE8A7FF)
+        .setTitle(`🌸 ${category}`)
+        .setDescription(lines.join("\n"))
+        .setFooter({
+          text: `Madokami • ${list.length} comandos`
+        })
+        .setTimestamp();
+
+      await interaction.editReply({
+        embeds: [categoryEmbed],
+        components: [createHelpMenu()]
+      });
+
+    } catch (error) {
+      console.error("HELP INTERACTION ERROR:", error);
+
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({
+          embeds: [
+            errorEmbed(
+              "No pude cargar esta categoría."
+            )
+          ]
+        }).catch(() => {});
+      }
+    }
+  }
+);
+
+// ============================================================
+// EVENTS
 // ============================================================
 
 client.once(Events.ClientReady, () => {
-  console.log("==========================================");
+  console.log("========================================");
   console.log("🌸 MADOKAMI CONECTADO");
   console.log(`🤖 ${client.user.tag}`);
-  console.log(`🌐 ${client.guilds.cache.size} servidores`);
-  console.log(`📚 ${commands.size} comandos registrados`);
-  console.log("==========================================");
+  console.log(`📚 ${commands.size} comandos`);
+  console.log("========================================");
 
-  client.user.setPresence({
-    activities: [
-      {
-        name: `m!help | ${client.guilds.cache.size} servidores`,
-        type: 0
-      }
-    ],
-    status: "online"
+  client.user.setActivity("m!help", {
+    type: 0
   });
 });
 
 // ============================================================
-// BIENVENIDAS / AUTOROL
+// MESSAGE CREATE
 // ============================================================
-
-client.on(Events.GuildMemberAdd, async member => {
-  const g = guildData(member.guild.id);
-
-  await sendLog(
-    member.guild,
-    "📥 MIEMBRO ENTRÓ",
-    `**Usuario:** ${member.user.tag}\n**ID:** ${member.id}`,
-    0x57F287
-  );
-
-  if (g.config.autoRole) {
-    const role = member.guild.roles.cache.get(g.config.autoRole);
-
-    if (role) {
-      await member.roles.add(role).catch(() => {});
-    }
-  }
-
-  if (g.config.welcome && g.config.welcomeChannel) {
-    const channel = member.guild.channels.cache.get(
-      g.config.welcomeChannel
-    );
-
-    if (channel?.isTextBased()) {
-      const text = g.config.welcomeMessage
-        .replaceAll("{user}", `<@${member.id}>`)
-        .replaceAll("{server}", member.guild.name);
-
-      channel.send({
-        embeds: [
-          embed("🌸 Bienvenido/a", text)
-        ]
-      }).catch(() => {});
-    }
-  }
-});
-
-client.on(Events.GuildMemberRemove, async member => {
-  await sendLog(
-    member.guild,
-    "📤 MIEMBRO SALIÓ",
-    `**Usuario:** ${member.user?.tag || "Desconocido"}\n**ID:** ${member.id}`,
-    0xFF4D6D
-  );
-});
-
-// ============================================================
-// LOGS DE MENSAJES
-// ============================================================
-
-const messageCache = new Map();
 
 client.on(Events.MessageCreate, async message => {
-  if (!message.guild || message.author.bot) return;
+  if (!message.guild) return;
+  if (message.author.bot) return;
 
-  const key = message.id;
+  cacheMessage(message);
 
-  messageCache.set(key, {
-    author: message.author.tag,
-    userId: message.author.id,
-    channelId: message.channel.id,
-    content: message.content,
-    at: Date.now()
-  });
+  const guild = getGuild(message.guild.id);
+  const user = getUser(message.guild.id, message.author.id);
 
-  if (messageCache.size > 5000) {
-    const first = messageCache.keys().next().value;
-    messageCache.delete(first);
-  }
+  user.messages++;
 
-  const g = guildData(message.guild.id);
-  const u = userData(message.guild.id, message.author.id);
-
-  g.messages++;
-  u.messages++;
-
-  if (!message.content.startsWith(PREFIX)) {
-    addXP(message.guild.id, message.author.id, 5);
-  }
-
-  // ----------------------------------------------------------
-  // ANTI-LINK
-  // ----------------------------------------------------------
+  // XP
+  const xpKey = `${message.guild.id}:${message.author.id}`;
 
   if (
-    g.config.antiLink &&
-    !isAdmin(message.member) &&
-    /https?:\/\/|www\./i.test(message.content)
+    !xpCooldown.has(xpKey) ||
+    Date.now() - xpCooldown.get(xpKey) >= 10000
   ) {
-    try {
-      await message.delete();
+    xpCooldown.set(xpKey, Date.now());
 
-      await message.member.timeout(
-        2 * 60 * 60 * 1000,
-        "Anti-link"
-      );
+    const result = addXP(
+      message.guild.id,
+      message.author.id,
+      random(5, 12)
+    );
 
-      await sendLog(
-        message.guild,
-        "🔗 ANTI-LINK",
-        `**Usuario:** ${message.author.tag}\n` +
-        `**Canal:** ${message.channel}\n` +
-        `**Mensaje eliminado:** ${truncate(message.content)}\n` +
-        `**Acción:** Timeout 2 horas`,
-        0xFF4D6D
-      );
-    } catch (err) {
-      console.error("Anti-link:", err);
+    if (result.leveledUp) {
+      message.channel.send(
+        `🎉 ${message.author} subió al **nivel ${result.newLevel}**!`
+      ).catch(() => {});
     }
+  }
+
+  // Anti-link
+  if (
+    guild.config.antiLink &&
+    !isAdmin(message.member) &&
+    containsLink(message.content)
+  ) {
+    await message.delete().catch(() => {});
+
+    await message.member
+      .timeout(
+        2 * 60 * 60 * 1000,
+        "Anti-link Madokami"
+      )
+      .catch(() => {});
+
+    await message.channel.send(
+      `🔗 ${message.author}, los enlaces no están permitidos aquí.`
+    ).then(msg => {
+      setTimeout(() => msg.delete().catch(() => {}), 5000);
+    }).catch(() => {});
+
+    await sendLog(
+      message.guild,
+      "Anti-link",
+      `👤 ${message.author.tag}\n` +
+      `📚 ${message.channel}\n` +
+      `📝 ${message.content || "[sin contenido]"}\n` +
+      `⏱️ Timeout: 2 horas`,
+      0xFF4444
+    );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // ANTI-SPAM
-  // ----------------------------------------------------------
-
+  // Anti-spam
   if (
-    g.config.antiSpam &&
+    guild.config.antiSpam &&
     !isAdmin(message.member)
   ) {
-    const now = Date.now();
+    const key = `${message.guild.id}:${message.author.id}`;
 
-    if (!g._spam) g._spam = {};
-
-    if (!g._spam[message.author.id]) {
-      g._spam[message.author.id] = [];
+    if (!spamTracker.has(key)) {
+      spamTracker.set(key, []);
     }
 
-    g._spam[message.author.id] =
-      g._spam[message.author.id].filter(
-        t => now - t < 7000
-      );
+    const times = spamTracker.get(key);
 
-    g._spam[message.author.id].push(now);
+    times.push(Date.now());
 
-    if (g._spam[message.author.id].length >= 6) {
-      try {
-        await message.delete();
+    while (
+      times.length &&
+      Date.now() - times[0] > 7000
+    ) {
+      times.shift();
+    }
 
-        if (!g._spamWarn) g._spamWarn = {};
+    if (times.length >= 6) {
+      times.length = 0;
 
-        if (!g._spamWarn[message.author.id] ||
-            now - g._spamWarn[message.author.id] > 30000) {
+      await message.delete().catch(() => {});
 
-          g._spamWarn[message.author.id] = now;
-
-          if (!g.warns[message.author.id]) {
-            g.warns[message.author.id] = [];
-          }
-
-          g.warns[message.author.id].push({
-            moderator: client.user.id,
-            reason: "Anti-spam",
-            at: now
-          });
-
-          await sendLog(
-            message.guild,
-            "🚨 ANTI-SPAM",
-            `**Usuario:** ${message.author.tag}\n` +
-            `**Canal:** ${message.channel}\n` +
-            `**Acción:** Mensaje eliminado + warn`,
-            0xFF4D6D
-          );
-        }
-
-        g._spam[message.author.id] = [];
-        saveDB();
-      } catch (err) {
-        console.error("Anti-spam:", err);
+      if (!guild.warns[message.author.id]) {
+        guild.warns[message.author.id] = [];
       }
+
+      guild.warns[message.author.id].push({
+        reason: "Anti-spam automático",
+        moderator: client.user.id,
+        date: Date.now()
+      });
+
+      scheduleSave();
+
+      await message.channel.send(
+        `🚫 ${message.author}, reduce el spam. Se eliminó tu mensaje.`
+      ).then(msg => {
+        setTimeout(() => msg.delete().catch(() => {}), 4000);
+      }).catch(() => {});
+
+      await sendLog(
+        message.guild,
+        "Anti-spam",
+        `👤 ${message.author.tag}\n` +
+        `📚 ${message.channel}\n` +
+        `⚠️ Warn automático`,
+        0xFFAA00
+      );
 
       return;
     }
   }
 
-  // ----------------------------------------------------------
-  // COMANDOS
-  // ----------------------------------------------------------
-
+  // Comando
   if (!message.content.startsWith(PREFIX)) return;
 
-  const body = message.content.slice(PREFIX.length).trim();
+  const args = message.content.trim().split(/\s+/);
+  const commandName = args.shift().slice(PREFIX.length).toLowerCase();
 
-  if (!body) return;
+  message.args = [
+    commandName,
+    ...args
+  ];
 
-  const args = body.split(/\s+/);
-  const commandName = args.shift().toLowerCase();
+  const handler = commands.get(commandName);
 
-  if (commandName === "helpad") {
-    return showAdminHelp(message);
-  }
+  if (!handler) return;
 
-  const command = commands.get(commandName);
-
-  if (!command) return;
-
-  u.commands++;
-
-  saveDB();
+  user.commands++;
+  scheduleSave();
 
   try {
-    await command.handler(message, args);
-  } catch (err) {
-    console.error(`Error en ${commandName}:`, err);
+    await handler(message);
+  } catch (error) {
+    console.error(
+      `ERROR EN ${PREFIX}${commandName}:`,
+      error
+    );
 
     await message.reply({
       embeds: [
         errorEmbed(
-          "Ocurrió un error ejecutando ese comando."
+          "Ocurrió un error ejecutando este comando.\n\n" +
+          "Revisa los Logs de Render para ver el error."
         )
       ]
     }).catch(() => {});
@@ -3465,94 +2820,160 @@ client.on(Events.MessageCreate, async message => {
 });
 
 // ============================================================
-// MENSAJES ELIMINADOS
+// MESSAGE DELETE LOG
 // ============================================================
 
 client.on(Events.MessageDelete, async message => {
   if (!message.guild) return;
+  if (message.author?.bot) return;
 
-  const cached = messageCache.get(message.id);
+  const cached =
+    messageCache.get(message.guild.id)?.get(message.id);
+
+  const author =
+    message.author?.tag ||
+    cached?.authorTag ||
+    "Usuario desconocido";
+
+  const content =
+    message.content ||
+    cached?.content ||
+    "Contenido no disponible";
 
   await sendLog(
     message.guild,
-    "🗑️ MENSAJE ELIMINADO",
-    `**Usuario:** ${cached?.author || message.author?.tag || "Desconocido"}\n` +
-    `**Canal:** ${message.channel}\n` +
-    `**Contenido:** ${truncate(cached?.content || message.content || "No disponible")}`,
-    0xFF4D6D
+    "Mensaje eliminado",
+    `👤 Usuario: ${author}\n` +
+    `📚 Canal: <#${message.channelId || cached?.channelId}>\n` +
+    `📝 Contenido:\n${content}`,
+    0xFF4444
   );
-
-  messageCache.delete(message.id);
 });
 
 // ============================================================
-// MENSAJES EDITADOS
+// MESSAGE UPDATE LOG
 // ============================================================
 
 client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
   if (!newMessage.guild) return;
+  if (newMessage.author?.bot) return;
 
-  if (
-    oldMessage.content === newMessage.content
-  ) return;
+  if (oldMessage.content === newMessage.content) return;
 
   await sendLog(
     newMessage.guild,
-    "✏️ MENSAJE EDITADO",
-    `**Usuario:** ${newMessage.author?.tag || "Desconocido"}\n` +
-    `**Canal:** ${newMessage.channel}\n\n` +
-    `**Antes:**\n${truncate(oldMessage.content || "No disponible", 1000)}\n\n` +
-    `**Después:**\n${truncate(newMessage.content || "No disponible", 1000)}`,
-    0xFEE75C
+    "Mensaje editado",
+    `👤 Usuario: ${newMessage.author?.tag || "Desconocido"}\n` +
+    `📚 Canal: <#${newMessage.channelId}>\n\n` +
+    `🔴 Antes:\n${oldMessage.content || "No disponible"}\n\n` +
+    `🟢 Después:\n${newMessage.content || "No disponible"}`,
+    0xFFAA00
   );
-
-  messageCache.set(newMessage.id, {
-    author: newMessage.author?.tag,
-    userId: newMessage.author?.id,
-    channelId: newMessage.channel.id,
-    content: newMessage.content,
-    at: Date.now()
-  });
 });
 
 // ============================================================
-// ROLES
+// MEMBER EVENTS
+// ============================================================
+
+client.on(Events.GuildMemberAdd, async member => {
+  const guild = getGuild(member.guild.id);
+  const config = guild.config;
+
+  await sendLog(
+    member.guild,
+    "Miembro entró",
+    `👤 ${member.user.tag}\n🆔 ${member.id}`,
+    0x9DFFB0
+  );
+
+  if (config.welcome && config.welcomeChannel) {
+    const channel = member.guild.channels.cache.get(
+      config.welcomeChannel
+    );
+
+    if (channel?.isTextBased()) {
+      const text = config.welcomeMessage
+        .replaceAll("{user}", `<@${member.id}>`)
+        .replaceAll("{server}", member.guild.name);
+
+      await channel.send({
+        content: text,
+        allowedMentions: {
+          users: [member.id]
+        }
+      }).catch(() => {});
+    }
+  }
+
+  if (config.autoRole) {
+    const role = member.guild.roles.cache.get(
+      config.autoRole
+    );
+
+    if (role) {
+      await member.roles.add(role).catch(() => {});
+    }
+  }
+});
+
+client.on(Events.GuildMemberRemove, async member => {
+  await sendLog(
+    member.guild,
+    "Miembro salió",
+    `👤 ${member.user?.tag || "Desconocido"}\n🆔 ${member.id}`,
+    0xFF8844
+  );
+});
+
+// ============================================================
+// ROLE EVENTS
 // ============================================================
 
 client.on(Events.GuildRoleCreate, async role => {
   await sendLog(
     role.guild,
-    "🎭 ROL CREADO",
-    `**Rol:** ${role.name}\n**ID:** ${role.id}`,
-    0x57F287
+    "Rol creado",
+    `🎭 Rol: ${role}\n🆔 ${role.id}`,
+    0x9DFFB0
   );
 });
 
 client.on(Events.GuildRoleDelete, async role => {
   await sendLog(
     role.guild,
-    "🗑️ ROL ELIMINADO",
-    `**Rol:** ${role.name}\n**ID:** ${role.id}`,
-    0xFF4D6D
+    "Rol eliminado",
+    `🎭 Rol: **${role.name}**\n🆔 ${role.id}`,
+    0xFF4444
   );
 });
 
 client.on(Events.GuildRoleUpdate, async (oldRole, newRole) => {
+  const changes = [];
+
+  if (oldRole.name !== newRole.name) {
+    changes.push(
+      `🏷️ Nombre: **${oldRole.name}** → **${newRole.name}**`
+    );
+  }
+
+  if (oldRole.hexColor !== newRole.hexColor) {
+    changes.push(
+      `🎨 Color: **${oldRole.hexColor}** → **${newRole.hexColor}**`
+    );
+  }
+
+  if (!changes.length) return;
+
   await sendLog(
     newRole.guild,
-    "✏️ ROL MODIFICADO",
-    `**Rol:** ${newRole.name}\n` +
-    `**Nombre anterior:** ${oldRole.name}\n` +
-    `**Color anterior:** ${oldRole.hexColor}\n` +
-    `**Color nuevo:** ${newRole.hexColor}\n` +
-    `**Posición anterior:** ${oldRole.position}\n` +
-    `**Posición nueva:** ${newRole.position}`,
-    0xFEE75C
+    "Rol modificado",
+    `🎭 Rol: ${newRole}\n${changes.join("\n")}`,
+    0xFFAA00
   );
 });
 
 // ============================================================
-// CANALES
+// CHANNEL EVENTS
 // ============================================================
 
 client.on(Events.ChannelCreate, async channel => {
@@ -3560,9 +2981,9 @@ client.on(Events.ChannelCreate, async channel => {
 
   await sendLog(
     channel.guild,
-    "📚 CANAL CREADO",
-    `**Canal:** ${channel.name}\n**ID:** ${channel.id}`,
-    0x57F287
+    "Canal creado",
+    `📚 Canal: ${channel}\n🆔 ${channel.id}`,
+    0x9DFFB0
   );
 });
 
@@ -3571,69 +2992,74 @@ client.on(Events.ChannelDelete, async channel => {
 
   await sendLog(
     channel.guild,
-    "🗑️ CANAL ELIMINADO",
-    `**Canal:** ${channel.name}\n**ID:** ${channel.id}`,
-    0xFF4D6D
+    "Canal eliminado",
+    `📚 Canal: **${channel.name}**\n🆔 ${channel.id}`,
+    0xFF4444
   );
 });
 
 client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
   if (!newChannel.guild) return;
 
+  const changes = [];
+
+  if (oldChannel.name !== newChannel.name) {
+    changes.push(
+      `🏷️ Nombre: **${oldChannel.name}** → **${newChannel.name}**`
+    );
+  }
+
+  if (changes.length) {
+    await sendLog(
+      newChannel.guild,
+      "Canal modificado",
+      `📚 Canal: ${newChannel}\n${changes.join("\n")}`,
+      0xFFAA00
+    );
+  }
+});
+
+// ============================================================
+// BAN EVENTS
+// ============================================================
+
+client.on(Events.GuildBanAdd, async ban => {
   await sendLog(
-    newChannel.guild,
-    "✏️ CANAL MODIFICADO",
-    `**Canal:** ${newChannel.name}\n` +
-    `**Nombre anterior:** ${oldChannel.name}\n` +
-    `**Nombre nuevo:** ${newChannel.name}`,
-    0xFEE75C
+    ban.guild,
+    "Ban detectado",
+    `👤 Usuario: ${ban.user.tag}\n🆔 ${ban.user.id}`,
+    0xFF4444
   );
 });
 
-// ============================================================
-// ERROR HANDLERS
-// ============================================================
-
-process.on("unhandledRejection", err => {
-  console.error("Unhandled Rejection:", err);
-});
-
-process.on("uncaughtException", err => {
-  console.error("Uncaught Exception:", err);
+client.on(Events.GuildBanRemove, async ban => {
+  await sendLog(
+    ban.guild,
+    "Ban eliminado",
+    `👤 Usuario: ${ban.user.tag}\n🆔 ${ban.user.id}`,
+    0x9DFFB0
+  );
 });
 
 // ============================================================
 // VALIDACIÓN DE COMANDOS
 // ============================================================
 
-function validateCommands() {
-  console.log("\n========== VALIDACIÓN ==========");
+for (const [category, list] of Object.entries(PUBLIC_COMMANDS)) {
+  const missing = list.filter(
+    name => !commands.has(name)
+  );
 
-  for (const [category, list] of Object.entries(categories)) {
-    const missing = list.filter(name => !commands.has(name));
-
-    console.log(
-      `${category}: ${list.length} comandos`
+  if (missing.length) {
+    console.error(
+      `❌ COMANDOS FALTANTES EN ${category}:`,
+      missing
     );
-
-    if (missing.length) {
-      console.error(
-        `❌ FALTAN: ${missing.join(", ")}`
-      );
-    } else {
-      console.log("✅ Todos registrados");
-    }
   }
-
-  console.log(`Total comandos públicos: ${Object.values(categories).flat().length}`);
-  console.log(`Total comandos registrados: ${commands.size}`);
-  console.log("================================\n");
 }
 
-validateCommands();
-
 // ============================================================
-// HTTP SERVER — RENDER
+// RENDER HTTP SERVER
 // ============================================================
 
 const server = http.createServer((req, res) => {
@@ -3641,24 +3067,45 @@ const server = http.createServer((req, res) => {
     "Content-Type": "text/plain; charset=utf-8"
   });
 
-  res.end(
-    `🌸 Madokami está funcionando.\n` +
-    `Servidores: ${client.guilds.cache.size}\n` +
-    `Comandos: ${commands.size}\n`
-  );
+  res.end("🌸 Madokami está online.");
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`🌐 HTTP activo en puerto ${PORT}`);
 });
 
 // ============================================================
-// LOGIN
+// START
 // ============================================================
+
+loadDB();
+
+process.on("SIGTERM", () => {
+  saveDB();
+
+  if (client) {
+    client.destroy();
+  }
+
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  saveDB();
+
+  if (client) {
+    client.destroy();
+  }
+
+  process.exit(0);
+});
 
 if (!process.env.DISCORD_TOKEN) {
   console.error("❌ FALTA DISCORD_TOKEN EN RENDER.");
   process.exit(1);
 }
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch(error => {
+  console.error("❌ ERROR CONECTANDO DISCORD:", error);
+  process.exit(1);
+});
