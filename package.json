@@ -6,7 +6,8 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@google/genai": "latest",
-    "discord.js": "^14.24.2"
+    "@google/genai": "^1.20.0",
+    "discord.js": "^14.24.0",
+    "express": "^5.1.0"
   }
 }
