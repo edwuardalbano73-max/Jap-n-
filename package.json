@@ -6,7 +6,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.24.2",
-    "openai": "^5.0.0"
+    "@google/genai": "latest",
+    "discord.js": "^14.24.2"
   }
 }
